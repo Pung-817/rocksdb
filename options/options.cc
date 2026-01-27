@@ -305,6 +305,9 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                      disable_auto_compactions);
     ROCKS_LOG_HEADER(log, "               Options.disable_intra_l0_compact: %d",
                      disable_intra_l0_compact);
+    ROCKS_LOG_HEADER(log, "                     Options.multiple_compaction: %d",
+                     multiple_compaction);
+
 
     const auto& it_compaction_style =
         compaction_style_to_string.find(compaction_style);

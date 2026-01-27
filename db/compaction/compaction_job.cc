@@ -564,6 +564,7 @@ void CompactionJob::GenSubcompactionBoundaries() {
     // Initialized by the number of input files
     num_planned_subcompactions = static_cast<uint64_t>(c->num_input_files(0));
     uint64_t max_subcompactions_limit = GetSubcompactionsLimit();
+    int start_level = c->start_level();
     if (max_subcompactions_limit < num_planned_subcompactions) {
       // Assert two pointers are not empty so that we can use extra
       // subcompactions against db compaction limits
@@ -579,6 +580,13 @@ void CompactionJob::GenSubcompactionBoundaries() {
           std::min(num_planned_subcompactions, GetSubcompactionsLimit());
     } else {
       num_planned_subcompactions = max_subcompactions_limit;
+      if (start_level == 2) {
+        num_planned_subcompactions =
+            std::max(1UL, static_cast<uint64_t>(num_planned_subcompactions) / 2);
+      } else if (start_level > 2) {
+        num_planned_subcompactions = std::min(static_cast<uint64_t>(2),
+                                  static_cast<uint64_t>(num_planned_subcompactions));
+      }
     }
   } else {
     num_planned_subcompactions = GetSubcompactionsLimit();

@@ -299,6 +299,9 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Disable Intra-L0 compaction
   bool disable_intra_l0_compact = false;
 
+  // If true, all compactions will be split to subcomapctions.
+  bool multiple_compaction = false;
+
   // This is a factory that provides TableFactory objects.
   // Default: a block-based table factory that provides a default
   // implementation of TableBuilder and TableReader with default

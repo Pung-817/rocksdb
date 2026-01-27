@@ -220,6 +220,7 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
   cf_opts->disable_auto_compactions = moptions.disable_auto_compactions;
   cf_opts->disable_intra_l0_compact =
       moptions.disable_intra_l0_compact;
+  cf_opts->multiple_compaction = moptions.multiple_compaction;
   cf_opts->soft_pending_compaction_bytes_limit =
       moptions.soft_pending_compaction_bytes_limit;
   cf_opts->hard_pending_compaction_bytes_limit =

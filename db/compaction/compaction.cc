@@ -863,6 +863,9 @@ bool Compaction::ShouldFormSubcompactions() const {
   if (cfd_ == nullptr) {
     return false;
   }
+  if (mutable_cf_options_.multiple_compaction && max_subcompactions_ > 1) {
+    return true;
+  }
 
   // Round-Robin pri under leveled compaction allows subcompactions by default
   // and the number of subcompactions can be larger than max_subcompactions_

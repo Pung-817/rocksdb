@@ -262,6 +262,14 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct MutableCFOptions, disable_auto_compactions),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"disable_intra_l0_compact",
+         {offsetof(struct MutableCFOptions, disable_intra_l0_compact),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"multiple_compaction",
+         {offsetof(struct MutableCFOptions, multiple_compaction),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"filter_deletes",
          {0, OptionType::kBoolean, OptionVerificationType::kDeprecated,
           OptionTypeFlags::kMutable}},
@@ -962,7 +970,8 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       sst_partitioner_factory(cf_options.sst_partitioner_factory),
       blob_cache(cf_options.blob_cache),
       persist_user_defined_timestamps(
-          cf_options.persist_user_defined_timestamps) {}
+          cf_options.persist_user_defined_timestamps),
+          multiple_compaction(cf_options.multiple_compaction) {}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 
@@ -1074,6 +1083,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  disable_auto_compactions);
   ROCKS_LOG_INFO(log, "                 disable_intra_l0_compact: %d",
                  disable_intra_l0_compact);
+  ROCKS_LOG_INFO(log, "                     multiple_compaction: %d",
+                 multiple_compaction);
   ROCKS_LOG_INFO(log, "      soft_pending_compaction_bytes_limit: %" PRIu64,
                  soft_pending_compaction_bytes_limit);
   ROCKS_LOG_INFO(log, "      hard_pending_compaction_bytes_limit: %" PRIu64,
