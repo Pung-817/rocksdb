@@ -124,6 +124,7 @@ struct MutableCFOptions {
         experimental_mempurge_threshold(
             options.experimental_mempurge_threshold),
         disable_auto_compactions(options.disable_auto_compactions),
+        disable_intra_l0_compact(options.disable_intra_l0_compact),
         soft_pending_compaction_bytes_limit(
             options.soft_pending_compaction_bytes_limit),
         hard_pending_compaction_bytes_limit(
@@ -190,6 +191,7 @@ struct MutableCFOptions {
         prefix_extractor(nullptr),
         experimental_mempurge_threshold(0.0),
         disable_auto_compactions(false),
+        disable_intra_l0_compact(false),
         soft_pending_compaction_bytes_limit(0),
         hard_pending_compaction_bytes_limit(0),
         level0_file_num_compaction_trigger(0),
@@ -274,6 +276,7 @@ struct MutableCFOptions {
 
   // Compaction related options
   bool disable_auto_compactions;
+  bool disable_intra_l0_compact;
   uint64_t soft_pending_compaction_bytes_limit;
   uint64_t hard_pending_compaction_bytes_limit;
   int level0_file_num_compaction_trigger;

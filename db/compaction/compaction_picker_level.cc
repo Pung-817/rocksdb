@@ -893,6 +893,9 @@ bool LevelCompactionBuilder::PickFileToCompact() {
 
 bool LevelCompactionBuilder::PickIntraL0Compaction() {
   start_level_inputs_.clear();
+   if (mutable_cf_options_.disable_intra_l0_compact) {
+    return false;
+  }
   const std::vector<FileMetaData*>& level_files =
       vstorage_->LevelFiles(0 /* level */);
   if (level_files.size() <
@@ -910,6 +913,9 @@ bool LevelCompactionBuilder::PickIntraL0Compaction() {
 }
 
 bool LevelCompactionBuilder::PickSizeBasedIntraL0Compaction() {
+  if (mutable_cf_options_.disable_intra_l0_compact) {
+    return false;
+  }
   assert(start_level_ == 0);
   int base_level = vstorage_->base_level();
   if (base_level <= 0) {
