@@ -29,6 +29,7 @@
 #include "db/compaction/file_pri.h"
 #include "db/dbformat.h"
 #include "db/internal_stats.h"
+#include "db/tiering_flat_index.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
@@ -2246,6 +2247,23 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
   }
 }
 
+Status Version::MakeL0Reader() {
+  Status s;
+  // TieringFlatIndex optimization is primarily for Level Compaction where L0 read
+  // amplification is high. It can also benefit Universal Compaction.
+  if (cfd_ != nullptr &&
+      (cfd_->ioptions()->compaction_style == kCompactionStyleLevel ||
+       cfd_->ioptions()->compaction_style == kCompactionStyleUniversal)) {
+    InternalIterator* iter = MakeIndexIterator();
+    if (global_index_reader_ == nullptr) {
+      global_index_reader_ = new TieringFlatIndex(&cfd_->internal_comparator());
+    }
+    s = BuildTieringFlatIndex(iter, global_index_reader_);
+    delete iter;
+  }
+  return s;
+}
+
 Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
                         const Slice& blob_index_slice,
                         FilePrefetchBuffer* prefetch_buffer,
@@ -2420,39 +2438,56 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   if (merge_operator_) {
     pinned_iters_mgr->StartPinning();
   }
-
-  FilePicker fp(user_key, ikey, &storage_info_.level_files_brief_,
-                storage_info_.num_non_empty_levels_,
-                &storage_info_.file_indexer_, user_comparator(),
-                internal_comparator());
-  FdWithKeyRange* f = fp.GetNextFile();
-
-  while (f != nullptr) {
-    if (*max_covering_tombstone_seq > 0) {
-      // The remaining files we look at will only contain covered keys, so we
-      // stop here.
-      break;
+  if (global_index_reader_ != nullptr) {
+    *status = global_index_reader_->Lookup(ikey, &get_context);
+    if (get_context.State() == GetContext::kFound ||
+        get_context.State() == GetContext::kDeleted ||
+        get_context.State() == GetContext::kCorrupt) {
+      return;
     }
-    if (get_context.sample()) {
-      sample_file_read_inc(f->file_metadata);
+    // If not found (or Merge in progress which requires further lookup),
+    // continue to file lookup. Note: If Lookup returns Status::OK() but state
+    // is kMerge, it means we found a Merge operand. Ideally TieringFlatIndex should
+    // handle Merge logic, but for now we assume simple Point Lookup
+    // optimization. If Lookup returned NotFound, we reset status to OK to allow
+    // falling through to FilePicker.
+    if (status->IsNotFound()) {
+      *status = Status::OK();
     }
+  } else {
+    FilePicker fp(user_key, ikey, &storage_info_.level_files_brief_,
+                  storage_info_.num_non_empty_levels_,
+                  &storage_info_.file_indexer_, user_comparator(),
+                  internal_comparator());
+    FdWithKeyRange* f = fp.GetNextFile();
 
-    bool timer_enabled =
-        GetPerfLevel() >= PerfLevel::kEnableTimeExceptForMutex &&
-        get_perf_context()->per_level_perf_context_enabled;
-    StopWatchNano timer(clock_, timer_enabled /* auto_start */);
-    *status = table_cache_->Get(
-        read_options, *internal_comparator(), *f->file_metadata, ikey,
-        &get_context, mutable_cf_options_.block_protection_bytes_per_key,
-        mutable_cf_options_.prefix_extractor,
-        cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
-        IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
-                        fp.IsHitFileLastInLevel()),
-        fp.GetHitFileLevel(), max_file_size_for_l0_meta_pin_);
-    // TODO: examine the behavior for corrupted key
-    if (timer_enabled) {
-      PERF_COUNTER_BY_LEVEL_ADD(get_from_table_nanos, timer.ElapsedNanos(),
-                                fp.GetHitFileLevel());
+    while (f != nullptr) {
+      if (*max_covering_tombstone_seq > 0) {
+        // The remaining files we look at will only contain covered keys, so we
+        // stop here.
+        break;
+      }
+      if (get_context.sample()) {
+        sample_file_read_inc(f->file_metadata);
+      }
+
+      bool timer_enabled =
+          GetPerfLevel() >= PerfLevel::kEnableTimeExceptForMutex &&
+          get_perf_context()->per_level_perf_context_enabled;
+      StopWatchNano timer(clock_, timer_enabled /* auto_start */);
+      *status = table_cache_->Get(
+          read_options, *internal_comparator(), *f->file_metadata, ikey,
+          &get_context, mutable_cf_options_.block_protection_bytes_per_key,
+          mutable_cf_options_.prefix_extractor,
+          cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
+          IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
+                          fp.IsHitFileLastInLevel()),
+          fp.GetHitFileLevel(), max_file_size_for_l0_meta_pin_);
+      // TODO: examine the behavior for corrupted key
+      if (timer_enabled) {
+        PERF_COUNTER_BY_LEVEL_ADD(get_from_table_nanos, timer.ElapsedNanos(),
+                                  fp.GetHitFileLevel());
+      }
     }
     if (!status->ok()) {
       if (db_statistics_ != nullptr) {
@@ -3991,26 +4026,25 @@ void SortFileByOverlappingRatio(
                            ? VersionStorageInfo::kNumberFilesToSort
                            : temp->size();
 
-  std::partial_sort(temp->begin(), temp->begin() + num_to_sort, temp->end(),
-                    [&](const Fsize& f1, const Fsize& f2) -> bool {
-                      // If score is the same, pick file with smaller keys.
-                      // This makes the algorithm more deterministic, and also
-                      // help the trivial move case to have more files to
-                      // extend.
-                      if (f1.file->marked_for_compaction ==
-                          f2.file->marked_for_compaction) {
-                        if (file_to_order[f1.file->fd.GetNumber()] ==
-                            file_to_order[f2.file->fd.GetNumber()]) {
-                          return icmp.Compare(f1.file->smallest,
-                                              f2.file->smallest) < 0;
-                        }
-                        return file_to_order[f1.file->fd.GetNumber()] <
-                               file_to_order[f2.file->fd.GetNumber()];
-                      } else {
-                        return f1.file->marked_for_compaction >
-                               f2.file->marked_for_compaction;
-                      }
-                    });
+  std::partial_sort(
+      temp->begin(), temp->begin() + num_to_sort, temp->end(),
+      [&](const Fsize& f1, const Fsize& f2) -> bool {
+        // If score is the same, pick file with smaller keys.
+        // This makes the algorithm more deterministic, and also
+        // help the trivial move case to have more files to
+        // extend.
+        if (f1.file->marked_for_compaction == f2.file->marked_for_compaction) {
+          if (file_to_order[f1.file->fd.GetNumber()] ==
+              file_to_order[f2.file->fd.GetNumber()]) {
+            return icmp.Compare(f1.file->smallest, f2.file->smallest) < 0;
+          }
+          return file_to_order[f1.file->fd.GetNumber()] <
+                 file_to_order[f2.file->fd.GetNumber()];
+        } else {
+          return f1.file->marked_for_compaction >
+                 f2.file->marked_for_compaction;
+        }
+      });
 }
 
 void SortFileByRoundRobin(const InternalKeyComparator& icmp,
@@ -5395,6 +5429,7 @@ Status VersionSet::ProcessManifestWrites(
       }
     }
     for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
+      versions[i]->MakeL0Reader();
       assert(!builder_guards.empty() &&
              builder_guards.size() == versions.size());
       auto* builder = builder_guards[i]->version_builder();
@@ -7027,6 +7062,36 @@ void VersionSet::AddLiveFiles(std::vector<uint64_t>* live_table_files,
   }
 }
 
+InternalIterator* Version::MakeIndexIterator() {
+  const std::vector<FileMetaData*>& files0 = storage_info_.LevelFiles(0);
+  const size_t space = files0.size();
+  InternalIterator** list = new InternalIterator*[space];
+  size_t num = 0;
+  ReadOptions read_options;
+  read_options.verify_checksums = true;
+  EnvOptions env_options;
+  const MutableCFOptions* mutable_cf_options =
+      cfd_->GetLatestMutableCFOptions();
+  for (size_t i = 0; i < files0.size(); i++) {
+    list[num++] = table_cache_->NewIterator(
+        read_options, env_options, cfd_->internal_comparator(), *files0[i],
+        nullptr /* range_del_agg */, mutable_cf_options->prefix_extractor,
+        nullptr /* table_reader_ptr */,
+        nullptr /* no per level latency histogram */,
+        TableReaderCaller::kCompaction, nullptr /* arena */,
+        false /* skip_filters */, 0 /* level */,
+        MaxFileSizeForL0MetaPin(*mutable_cf_options),
+        nullptr /* smallest_compaction_key */,
+        nullptr /* largest_compaction_key */,
+        false /* allow_unprepared_value */,
+        mutable_cf_options->block_protection_bytes_per_key);
+  }
+  InternalIterator* result = NewMergingIterator(&cfd_->internal_comparator(),
+                                                list, static_cast<int>(num));
+  delete[] list;
+  return result;
+}
+
 InternalIterator* VersionSet::MakeInputIterator(
     const ReadOptions& read_options, const Compaction* c,
     RangeDelAggregator* range_del_agg,
@@ -7397,6 +7462,12 @@ Status ReactiveVersionSet::Recover(
       read_options_, EpochNumberRequirement::kMightMissing));
 
   manifest_tailer_->Iterate(*reader, manifest_reader_status->get());
+
+  for (auto cfd : *column_family_set_) {
+    if (cfd->initialized()) {
+      cfd->current()->MakeL0Reader();
+    }
+  }
 
   s = manifest_tailer_->status();
   if (s.ok()) {

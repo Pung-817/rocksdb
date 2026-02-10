@@ -710,6 +710,7 @@ set(SOURCES
         db/logs_with_prep_tracker.cc
         db/log_reader.cc
         db/log_writer.cc
+        db/tiering_flat_index.cc
         db/malloc_stats.cc
         db/memtable.cc
         db/memtable_list.cc

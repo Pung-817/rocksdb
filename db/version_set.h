@@ -1026,6 +1026,9 @@ class Version {
 
   const MutableCFOptions& GetMutableCFOptions() { return mutable_cf_options_; }
 
+  InternalIterator* MakeIndexIterator();
+  Status MakeL0Reader();
+
   InternalIterator* TEST_GetLevelIterator(
       const ReadOptions& read_options, MergeIteratorBuilder* merge_iter_builder,
       int level, bool allow_unprepared_value);
@@ -1038,6 +1041,8 @@ class Version {
   friend class VersionSet;
   friend class VersionEditHandler;
   friend class VersionEditHandlerPointInTime;
+
+  struct TieringFlatIndex* global_index_reader_ = nullptr;
 
   const InternalKeyComparator* internal_comparator() const {
     return storage_info_.internal_comparator_;

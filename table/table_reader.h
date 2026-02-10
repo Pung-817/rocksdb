@@ -29,6 +29,7 @@ class Slice;
 class Arena;
 struct ReadOptions;
 struct TableProperties;
+struct ImmutableOptions;
 class GetContext;
 class MultiGetContext;
 
@@ -189,5 +190,15 @@ class TableReader {
     return Status::NotSupported("VerifyChecksum() not supported");
   }
 };
+
+Status NewTableMemReader(const ImmutableCFOptions& icfo,
+                         const TableReaderOptions& table_reader_options,
+                         std::unique_ptr<TableReader>& file_table_reader,
+                         std::unique_ptr<TableReader>* mem_table_reader);
+Status NewMapIndexReader(const ImmutableCFOptions& icfo,
+                         std::unique_ptr<TableReader>& file_table_reader,
+                         std::unique_ptr<TableReader>* mem_table_reader);
+Status NewMapIndexReader(const ImmutableOptions& ioptions, InternalIterator* iter,
+                         std::unique_ptr<TableReader>* mem_table_reader);
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -24,6 +24,7 @@
 #include "cache/cache_key.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
+#include "db/tiering_flat_index.h"
 #include "db/pinned_iterators_manager.h"
 #include "file/file_prefetch_buffer.h"
 #include "file/file_util.h"
@@ -47,6 +48,8 @@
 #include "rocksdb/table_properties.h"
 #include "rocksdb/trace_record.h"
 #include "table/block_based/binary_search_index_reader.h"
+#include "memtable/skiplist.h"
+#include "options/cf_options.h"
 #include "table/block_based/block.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/block_based/block_based_table_iterator.h"
@@ -3230,6 +3233,414 @@ void BlockBasedTable::DumpKeyValue(const Slice& key, const Slice& value,
 
   out_stream << "  ASCII  " << res_key << ": " << res_value << "\n";
   out_stream << "  ------\n";
+}
+
+namespace {
+
+// Adapter to expose TieringFlatIndex as an InternalIterator
+class TieringFlatIndexIterator : public InternalIterator {
+ public:
+  explicit TieringFlatIndexIterator(const TieringFlatIndex* index)
+      : index_(index), idx_(0) {}
+
+  bool Valid() const override {
+    return index_ != nullptr && idx_ < index_->key_nums;
+  }
+
+  void SeekToFirst() override { idx_ = 0; }
+
+  void SeekToLast() override {
+    if (index_->key_nums > 0)
+      idx_ = index_->key_nums - 1;
+    else
+      idx_ = 0;
+  }
+
+  void Seek(const Slice& target) override { idx_ = index_->getIdx(target); }
+
+  void SeekForPrev(const Slice& target) override {
+    idx_ = index_->getIdx(target);
+    if (idx_ >= index_->key_nums) {
+      if (index_->key_nums > 0) idx_ = index_->key_nums - 1;
+    } else {
+      // getIdx returns first key >= target.
+      // If key[idx] > target, then prev is idx-1.
+      // If key[idx] == target, then prev is idx (semantically SeekForPrev finds
+      // last key <= target).
+      if (idx_ > 0 && index_->c->Compare(index_->getKey(idx_), target) > 0) {
+        idx_--;
+      }
+    }
+  }
+
+  void Next() override { idx_++; }
+
+  void Prev() override {
+    if (idx_ > 0)
+      idx_--;
+    else
+      idx_ = index_->key_nums;  // Make invalid
+  }
+
+  Slice key() const override {
+    assert(Valid());
+    return index_->getKey(idx_);
+  }
+
+  Slice value() const override {
+    assert(Valid());
+    return index_->getValue(idx_);
+  }
+
+  Status status() const override { return Status::OK(); }
+
+ private:
+  const TieringFlatIndex* index_;
+  size_t idx_;
+};
+
+}  // namespace
+
+inline Slice ArenaPinSlice(const Slice& s, Arena* arena) {
+  char* mem = arena->Allocate(s.size());
+  if (s.size() > 0) {
+    memcpy(mem, s.data(), s.size());
+  }
+  return Slice(mem, s.size());
+}
+
+class TableMapIndexReader : public TableReader {
+ public:
+  ~TableMapIndexReader() { delete index_; }
+
+  TableMapIndexReader(const ImmutableOptions& ioptions,
+                      std::unique_ptr<TableReader>& /*table_reader*/)
+      : ioptions_(ioptions) {}
+
+  TableMapIndexReader(const ImmutableOptions& ioptions)
+      : ioptions_(ioptions) {}
+
+
+  // TieringFlatIndex is in-memory, so ApproximateOffsetOf is not very meaningful,
+  // return 0.
+  uint64_t ApproximateOffsetOf(const ReadOptions& /*read_options*/,
+                               const Slice& /*key*/,
+                               TableReaderCaller /*caller*/) override {
+    return 0;
+  }
+
+  uint64_t ApproximateSize(const ReadOptions& /*read_options*/,
+                           const Slice& /*start*/, const Slice& /*end*/,
+                           TableReaderCaller /*caller*/) override {
+    return 0;
+  }
+
+  void SetupForCompaction() override {}
+
+  std::shared_ptr<const TableProperties> GetTableProperties() const override {
+    return table_properties_;
+  }
+
+  InternalIterator* NewIterator(const ReadOptions&,
+                                const SliceTransform* /*prefix_extractor*/,
+                                Arena* /*arena*/ = nullptr,
+                                bool /*skip_filters*/ = false,
+                                TableReaderCaller /*caller*/ =
+                                    TableReaderCaller::kUncategorized,
+                                size_t /*compaction_readahead_size*/ = 0,
+                                bool /*allow_unprepared_value*/ = false) override {
+    return new TieringFlatIndexIterator(index_);
+  }
+
+  using TableReader::NewRangeTombstoneIterator;
+
+  FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
+      const ReadOptions& /*read_options*/) override {
+    // Current TieringFlatIndex does not support range tombstones separately.
+    // They should be merged into the index or handled separately.
+    // For now returning nullptr as per original implementation.
+    return nullptr;
+  }
+
+  size_t ApproximateMemoryUsage() const override {
+    return index_ ? index_->size() : 0;
+  }
+
+  Status Get(const ReadOptions& /*readOptions*/, const Slice& key,
+             GetContext* get_context,
+             const SliceTransform* /*prefix_extractor*/,
+             bool /*skip_filters*/ = false) override {
+    if (index_ == nullptr) return Status::NotFound();
+    return index_->Lookup(key, get_context);
+  }
+
+  Status Open(InternalIterator* iter);
+  Status Open(std::unique_ptr<TableReader>& table_reader);
+
+ private:
+  const ImmutableOptions& ioptions_;
+  TieringFlatIndex* index_ = nullptr;
+  std::shared_ptr<const TableProperties> table_properties_;
+};
+
+Status TableMapIndexReader::Open(InternalIterator* iter) {
+  Status status;
+  index_ = new TieringFlatIndex(&ioptions_.internal_comparator);
+  StopWatchNano timer(ioptions_.clock, /*auto_start=*/true);
+  status = BuildTieringFlatIndex(iter, index_);
+  if (index_ != nullptr) {
+    ROCKS_LOG_INFO(
+        ioptions_.info_log,
+        "[BuildTieringFlatIndex] finished build map index, elapsed_nanos=%" PRIu64
+        ", key_size= %zu, value_lens= %zu, key_nums= %zu",
+        timer.ElapsedNanos(), index_->key_len, index_->value_len,
+        index_->key_nums);
+  }
+  return status;
+}
+
+Status TableMapIndexReader::Open(std::unique_ptr<TableReader>& table_reader) {
+  // We need to iterate over the input table reader to build our index
+  std::unique_ptr<InternalIterator> iter(table_reader->NewIterator(
+      ReadOptions(), nullptr, nullptr, false, TableReaderCaller::kUncategorized));
+  return Open(iter.get());
+}
+// for small sst and frequence-used sst, force it in memory
+constexpr uint16_t kMaxHeight = 12;  // same as SkipList constructor
+class TableMemReader : public TableReader {
+  struct MemEntry {
+    MemEntry(int) {
+      // create empty entry
+    }
+    MemEntry(Slice _ikey) : ikey(_ikey), idx(0) {}
+    MemEntry(Slice _ikey, Slice _val, uint64_t _idx)
+        : ikey(_ikey), value(_val), idx(_idx) {}
+    Slice ikey;
+    Slice value;
+    uint64_t idx;
+    uint64_t Size() { return ikey.size() + value.size(); }
+  };
+  struct MemEntryComparator {
+    MemEntryComparator(const InternalKeyComparator& _c) : c(_c) {}
+    int operator()(const MemEntry& l, const MemEntry& r) const {
+      return c.Compare(l.ikey, r.ikey);
+    }
+    const InternalKeyComparator& c;
+  };
+
+  typedef SkipList<MemEntry, MemEntryComparator> Holder;
+  class Iter : public InternalIterator {
+   public:
+    Iter(TableMemReader& reader)
+        : iter_(&reader.GetList()) {}
+    bool Valid() const override { return iter_.Valid(); }
+    void SeekToFirst() override { iter_.SeekToFirst(); }
+    void SeekToLast() override { iter_.SeekToLast(); }
+    void SeekForPrev(const Slice& key) override {
+      auto entry = MemEntry(key);
+      iter_.SeekForPrev(entry);
+    }
+    void Seek(const Slice& key) override {
+      auto entry = MemEntry(key);
+      iter_.Seek(entry);
+    }
+    void Next() override { iter_.Next(); }
+    void Prev() override { iter_.Prev(); }
+    Slice key() const override { return iter_.key().ikey; }
+    Slice value() const override {
+      return iter_.key().value;
+    }
+    Status status() const override { return Status::OK(); }
+
+   private:
+    Holder::Iterator iter_;
+  };
+
+ public:
+  TableMemReader(const ImmutableOptions& ioptions,
+                 const TableReaderOptions& table_reader_options,
+                 std::unique_ptr<TableReader>& table_reader)
+      : listkey_arena_(table_reader->GetTableProperties()->raw_key_size),
+        val_arena_(table_reader->GetTableProperties()->raw_value_size),
+        list_(ioptions.internal_comparator, &listkey_arena_,
+              kMaxHeight /*max_height*/),
+        ioptions_(ioptions),
+        table_reader_options_(table_reader_options),
+        file_data_size_(table_reader->GetTableProperties()->data_size) {}
+
+  void RangeScan(const Slice* begin, const SliceTransform* /*prefix_extractor*/,
+                 void* arg,
+                 bool (*callback_func)(void* arg, const Slice& key,
+                                       const Slice& value)) {
+    Iter iter(*this);
+    for (begin == nullptr ? iter.SeekToFirst() : iter.Seek(*begin);
+         iter.Valid() && callback_func(arg, iter.key(), iter.value());
+         iter.Next()) {
+    }
+  }
+
+  InternalIterator* NewIterator(const ReadOptions&,
+                                const SliceTransform* /*prefix_extractor*/,
+                                Arena* arena = nullptr,
+                                bool /*skip_filters*/ = false,
+                                TableReaderCaller /*caller*/ =
+                                    TableReaderCaller::kUncategorized,
+                                size_t /*compaction_readahead_size*/ = 0,
+                                bool /*allow_unprepared_value*/ = false) override {
+    if (arena == nullptr) {
+      return new Iter(*this);
+    } else {
+      auto* mem = arena->AllocateAligned(sizeof(TableMemReader::Iter));
+      return new (mem) Iter(*this);
+    }
+  }
+
+  using TableReader::NewRangeTombstoneIterator;
+
+  FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
+      const ReadOptions& read_options) override {
+    if (fragmented_range_dels_ == nullptr) {
+      return nullptr;
+    }
+    SequenceNumber snapshot = kMaxSequenceNumber;
+    if (read_options.snapshot != nullptr) {
+      snapshot = read_options.snapshot->GetSequenceNumber();
+    }
+    auto icomp = &table_reader_options_.internal_comparator;
+    return new FragmentedRangeTombstoneIterator(
+        std::const_pointer_cast<FragmentedRangeTombstoneList>(
+            fragmented_range_dels_),
+        *icomp, snapshot);
+  }
+
+  uint64_t ApproximateOffsetOf(const ReadOptions& read_options,
+                               const Slice& key,
+                               TableReaderCaller caller) override;
+  uint64_t ApproximateSize(const ReadOptions& /*read_options*/,
+                           const Slice& /*start*/, const Slice& /*end*/,
+                           TableReaderCaller /*caller*/) override {
+    return 0;
+  }
+  void SetupForCompaction() override {}
+  std::shared_ptr<const TableProperties> GetTableProperties() const override {
+    assert(table_properties_);
+    return table_properties_;
+  }
+
+  size_t ApproximateMemoryUsage() const override {
+    return listkey_arena_.ApproximateMemoryUsage() +
+           val_arena_.ApproximateMemoryUsage();
+  }
+
+  Status Get(const ReadOptions& readOptions, const Slice& key,
+             GetContext* get_context, const SliceTransform* prefix_extractor,
+             bool skip_filters = false) override;
+  Status Open(std::unique_ptr<TableReader>& table_reader);
+  const Holder& GetList() { return list_; }
+
+ private:
+  Arena listkey_arena_;
+  Arena val_arena_;
+  Holder list_;
+  const ImmutableOptions& ioptions_;
+  const TableReaderOptions& table_reader_options_;
+  const uint64_t file_data_size_;
+  uint64_t entry_size_;
+  std::shared_ptr<const FragmentedRangeTombstoneList> fragmented_range_dels_;
+  std::shared_ptr<const TableProperties> table_properties_;
+};
+
+uint64_t TableMemReader::ApproximateOffsetOf(const ReadOptions& /*read_options*/,
+                                             const Slice& key,
+                                             TableReaderCaller /*caller*/) {
+  // FIXME
+  Holder::Iterator iter(&list_);
+  auto entry = MemEntry(key);
+  iter.Seek(entry);
+  if (!iter.Valid()) {
+    return 0;
+  }
+  return uint64_t((iter.key().idx / (double)table_properties_->num_entries) *
+                  file_data_size_);
+}
+
+Status TableMemReader::Get(const ReadOptions& /*readOptions*/, const Slice& key,
+                           GetContext* get_context,
+                           const SliceTransform* /*prefix_extractor*/,
+                           bool /*skip_filters*/) {
+  Status status;
+  Holder::Iterator iter(&list_);
+  auto entry = MemEntry(key);
+  iter.Seek(entry);
+  bool match = false;
+  while (iter.Valid()) {
+    ParsedInternalKey parsed_cur_key;
+    if (!ParseInternalKey(iter.key().ikey, &parsed_cur_key, true /* log_err_key */).ok()) {
+      status = Status::Corruption(Slice());
+      break;
+    }
+    Status read_status;
+    if (!get_context->SaveValue(
+            parsed_cur_key, iter.key().value,
+            &match, &read_status)) {
+      break;
+    }
+    iter.Next();
+  }
+  return status;
+}
+
+Status TableMemReader::Open(std::unique_ptr<TableReader>& table_reader) {
+  Status status;
+  table_properties_ = table_reader->GetTableProperties();
+  // fragmented_range_dels_ = table_reader->GetFragmentedRangeTombstoneList();
+  uint64_t entry_idx = 0;
+  auto iter = table_reader->NewIterator(ReadOptions(), nullptr, nullptr, false,
+                                        TableReaderCaller::kUncategorized);
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    auto lazy_val = iter->value();
+    MemEntry entry(ArenaPinSlice(iter->key(), &listkey_arena_),
+                   ArenaPinSlice(lazy_val, &val_arena_), entry_idx);
+    list_.Insert(entry);
+    entry_size_ += entry.Size();
+    ++entry_idx;
+  }
+  return status;
+}
+
+Status NewTableMemReader(const ImmutableOptions& ioptions,
+                         const TableReaderOptions& table_reader_options,
+                         std::unique_ptr<TableReader>& file_table_reader,
+                         std::unique_ptr<TableReader>* mem_table_reader) {
+  TableMemReader* mem_reader =
+      new TableMemReader(ioptions, table_reader_options, file_table_reader);
+  Status status = mem_reader->Open(file_table_reader);
+  if (status.ok()) mem_table_reader->reset(mem_reader);
+  return status;
+}
+
+Status NewMapIndexReader(const ImmutableOptions& ioptions,
+                         std::unique_ptr<TableReader>& file_table_reader,
+                         std::unique_ptr<TableReader>* mem_table_reader) {
+  TableMapIndexReader* map_index_reader =
+      new TableMapIndexReader(ioptions, file_table_reader);
+  Status status = map_index_reader->Open(file_table_reader);
+  if (status.ok())
+    mem_table_reader->reset(map_index_reader);
+  else
+    delete map_index_reader;
+  return status;
+}
+
+Status NewMapIndexReader(const ImmutableOptions& ioptions, InternalIterator* iter,
+                         std::unique_ptr<TableReader>* mem_table_reader) {
+  TableMapIndexReader* map_index_reader = new TableMapIndexReader(ioptions);
+  Status status = map_index_reader->Open(iter);
+  if (status.ok())
+    mem_table_reader->reset(map_index_reader);
+  else
+    delete map_index_reader;
+  return status;
 }
 
 }  // namespace ROCKSDB_NAMESPACE
