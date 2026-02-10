@@ -134,6 +134,7 @@ DEFINE_string(
     "readtocache,"
     "readreverse,"
     "readwhilewriting,"
+    "writewhilereading,"
     "readwhilemerging,"
     "readwhilescanning,"
     "readrandomwriterandom,"
@@ -3615,6 +3616,9 @@ class Benchmark {
       } else if (name == "readwhilewriting") {
         num_threads++;  // Add extra thread for writing
         method = &Benchmark::ReadWhileWriting;
+      } else if (name == "writewhilereading") {
+        num_threads++;  // Add extra thread for reading
+        method = &Benchmark::WriteWhileReading;
       } else if (name == "readwhilemerging") {
         num_threads++;  // Add extra thread for writing
         method = &Benchmark::ReadWhileMerging;
@@ -6930,6 +6934,14 @@ class Benchmark {
       ReadRandom(thread);
     } else {
       BGWriter(thread, kWrite);
+    }
+  }
+
+  void WriteWhileReading(ThreadState* thread) {
+    if (thread->tid > 0) {
+      BGWriter(thread, kWrite);
+    } else {
+      ReadRandom(thread);
     }
   }
 
