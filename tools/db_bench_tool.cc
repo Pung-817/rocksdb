@@ -2168,6 +2168,8 @@ class Stats {
   uint64_t last_report_done_;
   uint64_t next_report_;
   uint64_t bytes_;
+  uint64_t read_bytes_;
+  uint64_t write_bytes_;
   uint64_t last_op_finish_;
   uint64_t last_report_finish_;
   std::unordered_map<OperationType, std::shared_ptr<HistogramImpl>,
@@ -2193,6 +2195,8 @@ class Stats {
     done_ = 0;
     last_report_done_ = 0;
     bytes_ = 0;
+    read_bytes_ = 0;
+    write_bytes_ = 0;
     seconds_ = 0;
     start_ = clock_->NowMicros();
     sine_interval_ = clock_->NowMicros();
@@ -2219,6 +2223,8 @@ class Stats {
 
     done_ += other.done_;
     bytes_ += other.bytes_;
+    read_bytes_ += other.read_bytes_;
+    write_bytes_ += other.write_bytes_;
     seconds_ += other.seconds_;
     if (other.start_ < start_) {
       start_ = other.start_;
@@ -2410,7 +2416,14 @@ class Stats {
     }
   }
 
-  void AddBytes(int64_t n) { bytes_ += n; }
+  void AddBytes(int64_t n, OperationType op_type = kOthers) { 
+    bytes_ += n; 
+    if (op_type == kRead) {
+      read_bytes_ += n;
+    } else if (op_type == kWrite) {
+      write_bytes_ += n;
+    }
+  }
 
   void Report(const Slice& name) {
     // Pretend at least one op was done in case we are running a benchmark
@@ -2473,6 +2486,37 @@ class CombinedStats {
       double mbs = (total_bytes_ / 1048576.0);
       throughput_mbs_.emplace_back(mbs / elapsed);
     }
+
+    // Extract read/write specific stats
+    uint64_t read_ops = 0;
+    uint64_t write_ops = 0;
+    
+    auto read_it = stat.hist_.find(kRead);
+    if (read_it != stat.hist_.end()) {
+        read_ops = read_it->second->num();
+    }
+    auto write_it = stat.hist_.find(kWrite);
+    if (write_it != stat.hist_.end()) {
+        write_ops = write_it->second->num();
+    }
+
+    if (read_ops > 0) {
+        throughput_read_ops_.emplace_back(read_ops / elapsed);
+    }
+    if (write_ops > 0) {
+        throughput_write_ops_.emplace_back(write_ops / elapsed);
+    }
+
+    if (stat.read_bytes_ > 0) {
+      double mbs = (stat.read_bytes_ / 1048576.0);
+      throughput_read_mbs_.emplace_back(mbs / elapsed);
+    }
+    if (stat.write_bytes_ > 0) {
+      double mbs = (stat.write_bytes_ / 1048576.0);
+      throughput_write_mbs_.emplace_back(mbs / elapsed);
+    }
+    
+    elapseds_.emplace_back(elapsed);
   }
 
   void Report(const std::string& bench_name) {
@@ -2484,17 +2528,43 @@ class CombinedStats {
     const char* name = bench_name.c_str();
     int num_runs = static_cast<int>(throughput_ops_.size());
 
+    fprintf(stdout, "%s [AVG %d runs] : %.3f (\xC2\xB1 %.3f) sec; ", name, num_runs,
+            CalcAvg(elapseds_), CalcConfidence95(elapseds_));
+
     if (throughput_mbs_.size() == throughput_ops_.size()) {
       fprintf(stdout,
-              "%s [AVG %d runs] : %d (\xC2\xB1 %d) ops/sec; %6.1f (\xC2\xB1 "
+              "%d (\xC2\xB1 %d) ops/sec; %6.1f (\xC2\xB1 "
               "%.1f) MB/sec\n",
-              name, num_runs, static_cast<int>(CalcAvg(throughput_ops_)),
+              static_cast<int>(CalcAvg(throughput_ops_)),
               static_cast<int>(CalcConfidence95(throughput_ops_)),
               CalcAvg(throughput_mbs_), CalcConfidence95(throughput_mbs_));
     } else {
-      fprintf(stdout, "%s [AVG %d runs] : %d (\xC2\xB1 %d) ops/sec\n", name,
-              num_runs, static_cast<int>(CalcAvg(throughput_ops_)),
+      fprintf(stdout, "%d (\xC2\xB1 %d) ops/sec\n",
+              static_cast<int>(CalcAvg(throughput_ops_)),
               static_cast<int>(CalcConfidence95(throughput_ops_)));
+    }
+
+    if (!throughput_read_ops_.empty()) {
+         fprintf(stdout, "%s [READ  %d runs] : %d (\xC2\xB1 %d) ops/sec", name,
+              static_cast<int>(throughput_read_ops_.size()), 
+              static_cast<int>(CalcAvg(throughput_read_ops_)),
+              static_cast<int>(CalcConfidence95(throughput_read_ops_)));
+         if (throughput_read_mbs_.size() == throughput_read_ops_.size()) {
+            fprintf(stdout, "; %6.1f (\xC2\xB1 %.1f) MB/sec",
+              CalcAvg(throughput_read_mbs_), CalcConfidence95(throughput_read_mbs_));
+         }
+         fprintf(stdout, "\n");
+    }
+    if (!throughput_write_ops_.empty()) {
+         fprintf(stdout, "%s [WRITE %d runs] : %d (\xC2\xB1 %d) ops/sec", name,
+              static_cast<int>(throughput_write_ops_.size()), 
+              static_cast<int>(CalcAvg(throughput_write_ops_)),
+              static_cast<int>(CalcConfidence95(throughput_write_ops_)));
+         if (throughput_write_mbs_.size() == throughput_write_ops_.size()) {
+            fprintf(stdout, "; %6.1f (\xC2\xB1 %.1f) MB/sec",
+              CalcAvg(throughput_write_mbs_), CalcConfidence95(throughput_write_mbs_));
+         }
+         fprintf(stdout, "\n");
     }
   }
 
@@ -2605,6 +2675,11 @@ class CombinedStats {
 
   std::vector<double> throughput_ops_;
   std::vector<double> throughput_mbs_;
+  std::vector<double> throughput_read_ops_;
+  std::vector<double> throughput_write_ops_;
+  std::vector<double> throughput_read_mbs_;
+  std::vector<double> throughput_write_mbs_;
+  std::vector<double> elapseds_;
 };
 
 class TimestampEmulator {
@@ -5954,7 +6029,7 @@ class Benchmark {
       }
     }
     delete iter;
-    thread->stats.AddBytes(bytes);
+    thread->stats.AddBytes(bytes, kRead);
   }
 
   void ReadRandomFast(ThreadState* thread) {
@@ -6018,6 +6093,7 @@ class Benchmark {
              "issued %" PRIu64 " non-exist keys)\n",
              found, read, nonexist);
 
+    thread->stats.AddBytes(0, kRead);
     thread->stats.AddMessage(msg);
   }
 
@@ -6153,7 +6229,7 @@ class Benchmark {
     snprintf(msg, sizeof(msg), "(%" PRIu64 " of %" PRIu64 " found)\n", found,
              read);
 
-    thread->stats.AddBytes(bytes);
+    thread->stats.AddBytes(bytes, kRead);
     thread->stats.AddMessage(msg);
   }
 
@@ -6252,7 +6328,7 @@ class Benchmark {
     char msg[100];
     snprintf(msg, sizeof(msg), "(%" PRIu64 " of %" PRIu64 " found)", found,
              read);
-    thread->stats.AddBytes(bytes);
+    thread->stats.AddBytes(bytes, kRead);
     thread->stats.AddMessage(msg);
   }
 
@@ -6863,7 +6939,7 @@ class Benchmark {
     char msg[100];
     snprintf(msg, sizeof(msg), "(%" PRIu64 " of %" PRIu64 " found)\n", found,
              read);
-    thread->stats.AddBytes(bytes);
+    thread->stats.AddBytes(bytes, kSeek);
     thread->stats.AddMessage(msg);
   }
 
@@ -7093,7 +7169,7 @@ class Benchmark {
       std::cout << "Number of range deletions: " << num_range_deletions
                 << std::endl;
     }
-    thread->stats.AddBytes(bytes);
+    thread->stats.AddBytes(bytes, kWrite);
   }
 
   void ReadWhileScanning(ThreadState* thread) {
@@ -7655,7 +7731,7 @@ class Benchmark {
     // Print some statistics
     char msg[100];
     snprintf(msg, sizeof(msg), "( updates:%" PRIu64 ")", readwrites_);
-    thread->stats.AddBytes(bytes);
+    thread->stats.AddBytes(bytes, kMerge);
     thread->stats.AddMessage(msg);
   }
 
@@ -8138,7 +8214,7 @@ class Benchmark {
     char msg[100];
     snprintf(msg, sizeof(msg), "(%" PRIu64 " of %" PRIu64 " found)", found,
              read);
-    thread->stats.AddBytes(bytes);
+    thread->stats.AddBytes(bytes, kRead);
     thread->stats.AddMessage(msg);
   }
 
@@ -8193,7 +8269,7 @@ class Benchmark {
       }
       bytes = key.size() + val.size();
       thread->stats.FinishedOps(&db_, db_.db, 1, kWrite);
-      thread->stats.AddBytes(bytes);
+      thread->stats.AddBytes(bytes, kWrite);
 
       if (FLAGS_benchmark_write_rate_limit > 0) {
         write_rate_limiter->Request(key.size() + val.size(), Env::IO_HIGH,
