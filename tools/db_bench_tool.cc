@@ -844,6 +844,8 @@ static enum ROCKSDB_NAMESPACE::CompressionType FLAGS_wal_compression_e =
 
 DEFINE_string(wal_dir, "", "If not empty, use the given dir for WAL");
 
+DEFINE_string(db_log_dir, "", "If not empty, use the given dir for info logs");
+
 DEFINE_string(truth_db, "/dev/shm/truth_db/dbbench",
               "Truth key/values used when using verify");
 
@@ -4706,6 +4708,7 @@ class Benchmark {
     options.use_adaptive_mutex = FLAGS_use_adaptive_mutex;
     options.bytes_per_sync = FLAGS_bytes_per_sync;
     options.wal_bytes_per_sync = FLAGS_wal_bytes_per_sync;
+    options.db_log_dir = FLAGS_db_log_dir;
 
     // merge operator options
     if (!FLAGS_merge_operator.empty()) {
