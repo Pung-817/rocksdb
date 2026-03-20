@@ -50,6 +50,9 @@ class RateLimiter {
     return Status::NotSupported();
   }
 
+  virtual void EnterHighPriRequest() {}
+  virtual void ExitHighPriRequest() {}
+
   // Deprecated. New RateLimiter derived classes should override
   // Request(const int64_t, const Env::IOPriority, Statistics*) or
   // Request(const int64_t, const Env::IOPriority, Statistics*, OpType)

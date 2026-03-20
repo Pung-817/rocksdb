@@ -66,7 +66,9 @@ GenericRateLimiter::GenericRateLimiter(
       auto_tuned_(auto_tuned),
       num_drains_(0),
       max_bytes_per_sec_(rate_bytes_per_sec),
-      tuned_time_(NowMicrosMonotonicLocked()) {
+      tuned_time_(NowMicrosMonotonicLocked()),
+      high_pri_requests_(0),
+      high_pri_cv_(&request_mutex_) {
   for (int i = Env::IO_LOW; i < Env::IO_TOTAL; ++i) {
     total_requests_[i] = 0;
     total_bytes_through_[i] = 0;
@@ -119,6 +121,19 @@ Status GenericRateLimiter::SetSingleBurstBytes(int64_t single_burst_bytes) {
   return Status::OK();
 }
 
+void GenericRateLimiter::EnterHighPriRequest() {
+  MutexLock g(&request_mutex_);
+  high_pri_requests_++;
+}
+
+void GenericRateLimiter::ExitHighPriRequest() {
+  MutexLock g(&request_mutex_);
+  high_pri_requests_--;
+  if (high_pri_requests_ == 0) {
+    high_pri_cv_.SignalAll();
+  }
+}
+
 void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri,
                                  Statistics* stats) {
   assert(bytes <= GetSingleBurstBytes());
@@ -127,6 +142,10 @@ void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri,
   TEST_SYNC_POINT_CALLBACK("GenericRateLimiter::Request:1",
                            &rate_bytes_per_sec_);
   MutexLock g(&request_mutex_);
+
+  while (high_pri_requests_ > 0 && pri == Env::IO_LOW && !stop_) {
+    high_pri_cv_.Wait();
+  }
 
   if (auto_tuned_) {
     static const int kRefillsPerTune = 100;

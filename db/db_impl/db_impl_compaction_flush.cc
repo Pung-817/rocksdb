@@ -3889,10 +3889,21 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
                             compaction_job_stats, job_context->job_id);
     mutex_.Unlock();
+
+    bool is_high_pri = (c->start_level() == 0);
+    if (is_high_pri && immutable_db_options_.rate_limiter) {
+      immutable_db_options_.rate_limiter->EnterHighPriRequest();
+    }
+
     TEST_SYNC_POINT_CALLBACK(
         "DBImpl::BackgroundCompaction:NonTrivial:BeforeRun", nullptr);
     // Should handle error?
     compaction_job.Run().PermitUncheckedError();
+
+    if (is_high_pri && immutable_db_options_.rate_limiter) {
+      immutable_db_options_.rate_limiter->ExitHighPriRequest();
+    }
+
     TEST_SYNC_POINT("DBImpl::BackgroundCompaction:NonTrivial:AfterRun");
     mutex_.Lock();
     status =

@@ -1146,7 +1146,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   // (b) CompactionFilter::Decision::kRemoveAndSkipUntil.
   read_options.total_order_seek = true;
 
-  const WriteOptions write_options(Env::IOPriority::IO_LOW,
+  const WriteOptions write_options(GetRateLimiterPriority(),
                                    Env::IOActivity::kCompaction);
 
   // Remove the timestamps from boundaries because boundaries created in
@@ -2151,6 +2151,10 @@ std::string CompactionJob::GetTableFileName(uint64_t file_number) {
 }
 
 Env::IOPriority CompactionJob::GetRateLimiterPriority() {
+  if (compact_ && compact_->compaction &&
+      compact_->compaction->start_level() == 0) {
+    return Env::IO_HIGH;
+  }
   if (versions_ && versions_->GetColumnFamilySet() &&
       versions_->GetColumnFamilySet()->write_controller()) {
     WriteController* write_controller =

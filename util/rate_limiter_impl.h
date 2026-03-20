@@ -38,6 +38,9 @@ class GenericRateLimiter : public RateLimiter {
 
   Status SetSingleBurstBytes(int64_t single_burst_bytes) override;
 
+  void EnterHighPriRequest() override;
+  void ExitHighPriRequest() override;
+
   // Request for token to write bytes. If this request can not be satisfied,
   // the call is blocked. Caller is responsible to make sure
   // bytes <= GetSingleBurstBytes() and bytes >= 0. Negative bytes
@@ -151,6 +154,9 @@ class GenericRateLimiter : public RateLimiter {
   int64_t num_drains_;
   const int64_t max_bytes_per_sec_;
   std::chrono::microseconds tuned_time_;
+
+  int high_pri_requests_;
+  port::CondVar high_pri_cv_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
