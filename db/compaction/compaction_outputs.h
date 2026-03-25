@@ -19,6 +19,8 @@
 namespace ROCKSDB_NAMESPACE {
 
 class CompactionOutputs;
+struct GuardMetaData;
+
 using CompactionFileOpenFunc = std::function<Status(CompactionOutputs&)>;
 using CompactionFileCloseFunc =
     std::function<Status(CompactionOutputs&, const Status&, const Slice&)>;
@@ -363,6 +365,10 @@ class CompactionOutputs {
   // range tombstone added to output file within each subcompaction is in
   // increasing key range.
   std::vector<size_t> level_ptrs_;
+
+  // PebblesDB guard keys boundaries for the output level
+  std::vector<GuardMetaData*> guards_;
+  size_t current_guard_ = 0;
 };
 
 // helper struct to concatenate the last level and penultimate level outputs

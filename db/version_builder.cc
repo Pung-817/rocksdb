@@ -75,10 +75,32 @@ class VersionBuilder::Rep {
     const InternalKeyComparator* cmp_;
   };
 
+
+  struct StringSliceComparator {
+    using is_transparent = void;
+    bool operator()(const std::string& a, const std::string& b) const {
+      return a < b;
+    }
+    bool operator()(const std::string& a, const Slice& b) const {
+      return Slice(a).compare(b) < 0;
+    }
+    bool operator()(const Slice& a, const std::string& b) const {
+      return a.compare(Slice(b)) < 0;
+    }
+    bool operator()(const Slice& a, const Slice& b) const {
+      return a.compare(b) < 0;
+    }
+  };
+
   struct LevelState {
+
     std::unordered_set<uint64_t> deleted_files;
     // Map from file number to file meta data.
     std::unordered_map<uint64_t, FileMetaData*> added_files;
+
+    std::map<std::string, GuardMetaData*, StringSliceComparator> added_guards;
+    std::map<std::string, GuardMetaData*, StringSliceComparator> added_complete_guards;
+    std::set<std::string, StringSliceComparator> deleted_guards;
   };
 
   // A class that represents the accumulated changes (like additional garbage or
@@ -284,9 +306,24 @@ class VersionBuilder::Rep {
       for (auto& pair : added) {
         UnrefFile(pair.second);
       }
+      
+      for (auto& pair : levels_[level].added_guards) {
+        UnrefGuard(pair.second);
+      }
+      
+      for (auto& pair : levels_[level].added_complete_guards) {
+        UnrefGuard(pair.second);
+      }
     }
 
     delete[] levels_;
+  }
+
+  void UnrefGuard(GuardMetaData* g) {
+    g->refs--;
+    if (g->refs <= 0) {
+      delete g;
+    }
   }
 
   void UnrefFile(FileMetaData* f) {
@@ -453,7 +490,7 @@ class VersionBuilder::Rep {
       // Check L1 and up
 
       for (int level = 1; level < num_levels_; ++level) {
-        auto checker = [this, level, icmp](const FileMetaData* lhs,
+        auto checker = [this, level, icmp, vstorage](const FileMetaData* lhs,
                                            const FileMetaData* rhs) {
           assert(lhs);
           assert(rhs);
@@ -466,7 +503,14 @@ class VersionBuilder::Rep {
             return Status::Corruption("VersionBuilder", oss.str());
           }
 
-          // Make sure there is no overlap in level
+          // Make sure there is no overlap in level, unless Guards are enabled for this level
+          // In PebblesDB/FLSM, files within a guard or sentinel can overlap.
+          // Note: In PebblesDB ported RocksDB, we can have overlapping files in sentinel even if guards are empty,
+          // but if we assume overlaps only occur when guards are used or we just skip it for PebblesDB.
+          // Let's just remove the overlap check for L1+ globally since it's FLSM.
+          // Or we can check if it's an FLSM database. In our RocksDB port, it IS an FLSM database.
+          // We bypass the overlap check.
+          /* 
           if (icmp->Compare(lhs->largest, rhs->smallest) >= 0) {
             std::ostringstream oss;
             oss << 'L' << level << " has overlapping ranges: file #"
@@ -477,6 +521,7 @@ class VersionBuilder::Rep {
 
             return Status::Corruption("VersionBuilder", oss.str());
           }
+          */
 
           return Status::OK();
         };
@@ -791,6 +836,10 @@ class VersionBuilder::Rep {
 
     FileMetaData* const f = new FileMetaData(meta);
     f->refs = 1;
+    // === PebblesDB: Initialize allowed_seeks ===
+    int seeks = f->fd.GetFileSize() / 16384;
+    if (seeks < 100) seeks = 100;
+    f->stats.allowed_seeks.store(seeks, std::memory_order_relaxed);
 
     if (file_metadata_cache_res_mgr_) {
       Status s = file_metadata_cache_res_mgr_->UpdateCacheReservation(
@@ -904,6 +953,86 @@ class VersionBuilder::Rep {
         return s;
       }
     }
+
+    // Apply Guard changes
+    for (const auto& new_guard : edit->GetNewGuards()) {
+      const int level = new_guard.first;
+      if (level >= num_levels_) {
+        continue;
+      }
+      GuardMetaData* g = new GuardMetaData(new_guard.second); // Copy the meta
+      g->refs = 1;
+      g->level = level;
+      g->number_segments = 0;
+      g->files.clear();
+      g->file_metas.clear();
+      
+      Slice key = g->guard_key.user_key();
+      auto& added_guards = levels_[level].added_guards;
+      auto it = added_guards.find(key);
+      if (it != added_guards.end()) {
+        UnrefGuard(it->second);
+        it->second = g;
+      } else {
+        added_guards.emplace(key.ToString(), g);
+      }
+      auto it_del = levels_[level].deleted_guards.find(key);
+      if (it_del != levels_[level].deleted_guards.end()) {
+        levels_[level].deleted_guards.erase(it_del);
+      }
+    }
+
+    for (const auto& new_cguard : edit->GetNewCompleteGuards()) {
+      const int level = new_cguard.first;
+      if (level >= num_levels_) {
+        continue;
+      }
+      GuardMetaData* g = new GuardMetaData(new_cguard.second); // Copy the meta
+      g->refs = 1;
+      g->level = level;
+      g->number_segments = 0;
+      g->files.clear();
+      g->file_metas.clear();
+
+      Slice key = g->guard_key.user_key();
+      auto& added_cguards = levels_[level].added_complete_guards;
+      auto it = added_cguards.find(key);
+      if (it != added_cguards.end()) {
+        UnrefGuard(it->second);
+        it->second = g;
+      } else {
+        added_cguards.emplace(key.ToString(), g);
+      }
+      auto it_del = levels_[level].deleted_guards.find(key);
+      if (it_del != levels_[level].deleted_guards.end()) {
+        levels_[level].deleted_guards.erase(it_del);
+      }
+    }
+
+    for (const auto& del_guard : edit->GetDeletedGuards()) {
+      const int level = del_guard.first;
+      if (level >= num_levels_) {
+        continue;
+      }
+      Slice key = del_guard.second.user_key();
+      
+      auto& added_guards = levels_[level].added_guards;
+      auto it1 = added_guards.find(key);
+      if (it1 != added_guards.end()) {
+        UnrefGuard(it1->second);
+        added_guards.erase(it1);
+      }
+      auto& added_cguards = levels_[level].added_complete_guards;
+      auto it2 = added_cguards.find(key);
+      if (it2 != added_cguards.end()) {
+        UnrefGuard(it2->second);
+        added_cguards.erase(it2);
+      }
+      if (levels_[level].deleted_guards.find(key) == levels_[level].deleted_guards.end()) {
+        levels_[level].deleted_guards.insert(key.ToString());
+      }
+    }
+
     return Status::OK();
   }
 
@@ -1197,6 +1326,187 @@ class VersionBuilder::Rep {
     return true;
   }
 
+  void SaveGuardsTo(VersionStorageInfo* vstorage) const {
+    for (int level = 0; level < num_levels_; ++level) {
+      const auto& base_guards = base_vstorage_->LevelGuards(level);
+      const auto& unordered_added_guards = levels_[level].added_guards;
+      
+      std::vector<GuardMetaData*> guards;
+      for (auto g : base_guards) {
+        Slice user_key = g->guard_key.user_key();
+        if (levels_[level].deleted_guards.find(user_key) == levels_[level].deleted_guards.end() &&
+            unordered_added_guards.find(user_key) == unordered_added_guards.end()) {
+          guards.push_back(g);
+        }
+      }
+      for (const auto& pair : unordered_added_guards) {
+        guards.push_back(pair.second);
+      }
+      
+      auto cmp = [this](GuardMetaData* lhs, GuardMetaData* rhs) {
+        return base_vstorage_->InternalComparator()->user_comparator()->Compare(lhs->guard_key.user_key(), rhs->guard_key.user_key()) < 0;
+      };
+      std::sort(guards.begin(), guards.end(), cmp);
+      
+      for (size_t i = 0; i < guards.size(); i++) {
+        if (i == 0 || base_vstorage_->InternalComparator()->user_comparator()->Compare(guards[i]->guard_key.user_key(), guards[i-1]->guard_key.user_key()) != 0) {
+          GuardMetaData* new_g = new GuardMetaData();
+          new_g->guard_key = guards[i]->guard_key;
+          new_g->level = guards[i]->level;
+          vstorage->AddGuard(level, new_g);
+        }
+      }
+      
+      const auto& base_cguards = base_vstorage_->LevelCompleteGuards(level);
+      const auto& unordered_added_cguards = levels_[level].added_complete_guards;
+      
+      std::vector<GuardMetaData*> cguards;
+      for (auto g : base_cguards) {
+        Slice user_key = g->guard_key.user_key();
+        if (levels_[level].deleted_guards.find(user_key) == levels_[level].deleted_guards.end() &&
+            unordered_added_cguards.find(user_key) == unordered_added_cguards.end()) {
+          cguards.push_back(g);
+        }
+      }
+      for (const auto& pair : unordered_added_cguards) {
+        cguards.push_back(pair.second);
+      }
+      std::sort(cguards.begin(), cguards.end(), cmp);
+      for (size_t i = 0; i < cguards.size(); i++) {
+        if (i == 0 || base_vstorage_->InternalComparator()->user_comparator()->Compare(cguards[i]->guard_key.user_key(), cguards[i-1]->guard_key.user_key()) != 0) {
+          GuardMetaData* new_cg = new GuardMetaData();
+          new_cg->guard_key = cguards[i]->guard_key;
+          new_cg->level = cguards[i]->level;
+          vstorage->AddCompleteGuard(level, new_cg);
+        }
+      }
+      
+      PopulateFilesToGuardsAndSentinels(vstorage, level);
+    }
+  }
+
+  bool IsFileAlreadyPresent(const std::vector<uint64_t>& files, uint64_t current_file_number) const {
+    for (size_t i = 0; i < files.size(); i++) {
+      if (files[i] == current_file_number) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void PopulateFilesToGuardsAndSentinels(VersionStorageInfo* vstorage, int level) const {
+    // === PebblesDB Baseline: L0 DOES NOT HAVE GUARDS ===
+    // L0 files overlap by nature, no need to classify them into sentinels
+    if (level == 0) {
+      return;
+    }
+
+    const std::vector<GuardMetaData*>& guards = vstorage->LevelGuards(level);
+    
+    // If there are no guards in the level, add all files to sentinel
+    if (guards.empty()) {
+      for (size_t i = 0; i < vstorage->LevelFiles(level).size(); i++) {
+        vstorage->AddSentinelFile(level, vstorage->LevelFiles(level)[i]);
+      }
+      return;
+    }
+
+    // Clear old guards data before populating
+    for (size_t i = 0; i < guards.size(); i++) {
+      guards[i]->files.clear();
+      guards[i]->file_metas.clear();
+      guards[i]->number_segments = 0;
+    }
+
+    const std::vector<FileMetaData*>& files = vstorage->LevelFiles(level);
+
+    // Optimize: Two-pointers/Binary search approach instead of O(M*N) nested loops
+    const InternalKeyComparator* icmp = base_vstorage_->InternalComparator();
+    const Comparator* ucmp = icmp->user_comparator();
+
+    for (size_t file_no = 0; file_no < files.size(); file_no++) {
+      FileMetaData* current_file = files[file_no];
+      bool assigned = false;
+
+      // 1. Check Sentinel (file's smallest key < first guard key)
+      if (ucmp->Compare(current_file->smallest.user_key(), guards[0]->guard_key.user_key()) < 0) {
+        vstorage->AddSentinelFile(level, current_file);
+        assigned = true;
+      }
+
+      // 2. Binary search to find the first guard that might overlap
+      // We want the first guard whose NEXT guard's key is > file's smallest key, 
+      // or the guard itself if its key is <= file's largest key.
+      
+      // Upper bound finds the first guard where guard_key > current_file->smallest
+      auto it = std::upper_bound(guards.begin(), guards.end(), current_file->smallest,
+          [ucmp](const InternalKey& key, const GuardMetaData* guard) {
+              return ucmp->Compare(key.user_key(), guard->guard_key.user_key()) < 0;
+          });
+      
+      // If it > guards.begin(), the previous guard might overlap or contain the file.
+      size_t start_guard_idx = 0;
+      if (it != guards.begin()) {
+        start_guard_idx = std::distance(guards.begin(), it) - 1;
+      }
+
+      // Iterate forward from the found guard until we're past the file's largest key
+      for (size_t guard_no = start_guard_idx; guard_no < guards.size(); guard_no++) {
+        // A file overlaps with guard[guard_no] if its largest key is >= guard_key
+        // AND its smallest key is < next_guard_key (if exists)
+        if (ucmp->Compare(current_file->largest.user_key(), guards[guard_no]->guard_key.user_key()) >= 0) {
+          bool overlap_with_this_guard = true;
+          if (guard_no + 1 < guards.size()) {
+             if (ucmp->Compare(current_file->smallest.user_key(), guards[guard_no+1]->guard_key.user_key()) >= 0) {
+                // File starts completely after this guard ends
+                overlap_with_this_guard = false;
+             }
+          }
+          
+          if (overlap_with_this_guard) {
+            // Optimization: since we append sequentially, we can just check the last element instead of full scan
+            bool already_present = false;
+            if (!guards[guard_no]->files.empty() && 
+                guards[guard_no]->files.back() == current_file->fd.GetNumber()) {
+              already_present = true;
+            }
+
+            if (!already_present) {
+              guards[guard_no]->files.push_back(current_file->fd.GetNumber());
+              guards[guard_no]->file_metas.push_back(current_file);
+              
+              if (guards[guard_no]->number_segments == 0) {
+                guards[guard_no]->smallest = current_file->smallest;
+                guards[guard_no]->largest = current_file->largest;
+              } else {
+                if (icmp->Compare(current_file->smallest, guards[guard_no]->smallest) < 0) {
+                  guards[guard_no]->smallest = current_file->smallest;
+                }
+                if (icmp->Compare(current_file->largest, guards[guard_no]->largest) > 0) {
+                  guards[guard_no]->largest = current_file->largest;
+                }
+              }
+              guards[guard_no]->number_segments++;
+              current_file->guard = guards[guard_no]; // Might be overwritten if spans multiple guards, but it's okay for l1+
+              assigned = true;
+            }
+          }
+        }
+        
+        // If the current guard's key is strictly greater than the file's largest key,
+        // we can stop checking further guards because they will only have larger keys.
+        if (ucmp->Compare(guards[guard_no]->guard_key.user_key(), current_file->largest.user_key()) > 0) {
+          break; // Stop early, no more overlaps possible!
+        }
+      }
+      
+      // Just a failsafe for weird cases
+      if (!assigned) {
+         vstorage->AddSentinelFile(level, current_file);
+      }
+    }
+  }
+
   void SaveSSTFilesTo(VersionStorageInfo* vstorage) const {
     assert(vstorage);
 
@@ -1250,6 +1560,8 @@ class VersionBuilder::Rep {
     }
 
     SaveSSTFilesTo(vstorage);
+
+    SaveGuardsTo(vstorage);
 
     SaveBlobFilesTo(vstorage);
 

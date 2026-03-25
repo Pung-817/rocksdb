@@ -155,6 +155,13 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
 }
 
 MemTable::~MemTable() {
+  for (auto& level_guards : complete_guards_) {
+    for (auto* g : level_guards) {
+      delete g;
+    }
+  }
+  complete_guards_.clear();
+
   mem_tracker_.FreeMem();
   assert(refs_ == 0);
 }

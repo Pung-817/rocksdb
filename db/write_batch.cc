@@ -69,6 +69,7 @@
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/duplicate_detector.h"
+#include "util/hash.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -90,6 +91,8 @@ enum ContentFlags : uint32_t {
   HAS_BLOB_INDEX = 1 << 10,
   HAS_BEGIN_UNPREPARE = 1 << 11,
   HAS_PUT_ENTITY = 1 << 12,
+  HAS_GUARD = 1 << 14,
+
   HAS_TIMED_PUT = 1 << 13,
 };
 
@@ -134,6 +137,13 @@ struct BatchContentClassifier : public WriteBatch::Handler {
 
   Status PutBlobIndexCF(uint32_t, const Slice&, const Slice&) override {
     content_flags |= ContentFlags::HAS_BLOB_INDEX;
+    return Status::OK();
+  }
+
+  Status HandleGuardCF(uint32_t, const Slice&, unsigned) override {
+    // Guard will just be put to memtable like PUT, but handled differently
+    // later
+    content_flags |= ContentFlags::HAS_PUT;
     return Status::OK();
   }
 
@@ -491,6 +501,26 @@ Status ReadRecordFromWriteBatch(Slice* input, char* tag,
         return Status::Corruption("bad WriteBatch TimedPut");
       }
       break;
+    case kTypeColumnFamilyGuard:
+      if (!GetVarint32(input, column_family)) {
+        return Status::Corruption("bad WriteBatch Guard");
+      }
+      FALLTHROUGH_INTENDED;
+    case kTypeGuard: {
+      if (!GetLengthPrefixedSlice(input, key)) {
+        return Status::Corruption("bad WriteBatch Guard");
+      }
+      const char* level_ptr = input->data();
+      uint32_t level;
+      if (!GetVarint32(input, &level)) {
+        return Status::Corruption("bad WriteBatch Guard");
+      }
+      // Calculate how many bytes GetVarint32 consumed by computing the pointer
+      // difference
+      size_t level_len = input->data() - level_ptr;
+      *value = Slice(level_ptr, level_len);
+      break;
+    }
     default:
       return Status::Corruption("unknown WriteBatch tag");
   }
@@ -739,6 +769,18 @@ Status WriteBatchInternal::Iterate(const WriteBatch* wb,
           ++found;
         }
         break;
+      case kTypeGuard:
+      case kTypeColumnFamilyGuard: {
+        uint32_t level;
+        Slice level_slice = value;
+        GetVarint32(&level_slice, &level);
+        s = handler->HandleGuardCF(column_family, key, level);
+        if (LIKELY(s.ok())) {
+          empty_batch = false;
+          ++found;
+        }
+        break;
+      }
       default:
         return Status::Corruption("unknown WriteBatch tag");
     }
@@ -905,6 +947,53 @@ Status WriteBatchInternal::TimedPut(WriteBatch* b, uint32_t column_family_id,
   return save.commit();
 }
 
+namespace {
+void TryInsertGuardToBatch(WriteBatch* b, ColumnFamilyHandle* column_family,
+                           const Slice& key) {
+  const unsigned int murmur_seed = 42;
+  uint32_t hash_result = Hash(key.data(), key.size(), murmur_seed);
+
+  unsigned max_levels = 7;
+  if (column_family != nullptr) {
+    auto cfd =
+        static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+    if (cfd != nullptr) {
+      max_levels = cfd->NumberLevels();
+    }
+  }
+
+  int num_bits = 27; /* top_level_bits */
+  const int bit_decrement = 2;
+
+  for (unsigned i = 0; i < max_levels; i++) {
+    unsigned bit_mask = 0;
+    if (num_bits >= 32) {
+      bit_mask = ~0U;
+    } else if (num_bits > 0) {
+      bit_mask = (1U << num_bits) - 1;
+    }
+    if ((hash_result & bit_mask) == bit_mask) {
+      unsigned start_level = (i == 0) ? 1 : i;
+      uint32_t cf_id = column_family ? column_family->GetID() : 0;
+      for (unsigned j = start_level; j < max_levels; j++) {
+        WriteBatchInternal::PutGuard(b, cf_id, key, j);
+      }
+      break;
+    }
+    num_bits -= bit_decrement;
+  }
+}
+
+void TryInsertGuardToBatch(WriteBatch* b, ColumnFamilyHandle* column_family,
+                           const SliceParts& key) {
+  std::string combined_key;
+  for (int i = 0; i < key.num_parts; ++i) {
+    combined_key.append(key.parts[i].data(), key.parts[i].size());
+  }
+  TryInsertGuardToBatch(b, column_family, Slice(combined_key));
+}
+}  // namespace
+
 Status WriteBatch::Put(ColumnFamilyHandle* column_family, const Slice& key,
                        const Slice& value) {
   size_t ts_sz = 0;
@@ -918,6 +1007,7 @@ Status WriteBatch::Put(ColumnFamilyHandle* column_family, const Slice& key,
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
 
   if (0 == ts_sz) {
     return WriteBatchInternal::Put(this, cf_id, key, value);
@@ -943,7 +1033,9 @@ Status WriteBatch::TimedPut(ColumnFamilyHandle* column_family, const Slice& key,
 
   if (!s.ok()) {
     return s;
-  } else if (ts_sz != 0) {
+  }
+  TryInsertGuardToBatch(this, column_family, key);
+  if (ts_sz != 0) {
     return Status::NotSupported(
         "TimedPut is not supported in combination with user-defined "
         "timestamps.");
@@ -957,6 +1049,8 @@ Status WriteBatch::Put(ColumnFamilyHandle* column_family, const Slice& key,
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
+
   has_key_with_ts_ = true;
   assert(column_family);
   uint32_t cf_id = column_family->GetID();
@@ -1015,6 +1109,24 @@ Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
   return save.commit();
 }
 
+Status WriteBatch::PutGuard(ColumnFamilyHandle* column_family, const Slice& key,
+                            int level) {
+  LocalSavePoint save(this);
+  WriteBatchInternal::SetCount(this, WriteBatchInternal::Count(this) + 1);
+  if (column_family == nullptr || column_family->GetID() == 0) {
+    rep_.push_back(static_cast<char>(kTypeGuard));
+  } else {
+    rep_.push_back(static_cast<char>(kTypeColumnFamilyGuard));
+    PutVarint32(&rep_, column_family->GetID());
+  }
+  PutLengthPrefixedSlice(&rep_, key);
+  PutVarint32(&rep_, level);
+  content_flags_.store(
+      content_flags_.load(std::memory_order_relaxed) | ContentFlags::HAS_GUARD,
+      std::memory_order_relaxed);
+  return save.commit();
+}
+
 Status WriteBatch::Put(ColumnFamilyHandle* column_family, const SliceParts& key,
                        const SliceParts& value) {
   size_t ts_sz = 0;
@@ -1028,6 +1140,7 @@ Status WriteBatch::Put(ColumnFamilyHandle* column_family, const SliceParts& key,
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
 
   if (ts_sz == 0) {
     return WriteBatchInternal::Put(this, cf_id, key, value);
@@ -1235,6 +1348,7 @@ Status WriteBatch::Delete(ColumnFamilyHandle* column_family, const Slice& key) {
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
 
   if (0 == ts_sz) {
     return WriteBatchInternal::Delete(this, cf_id, key);
@@ -1254,6 +1368,8 @@ Status WriteBatch::Delete(ColumnFamilyHandle* column_family, const Slice& key,
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
+
   assert(column_family);
   has_key_with_ts_ = true;
   uint32_t cf_id = column_family->GetID();
@@ -1302,6 +1418,7 @@ Status WriteBatch::Delete(ColumnFamilyHandle* column_family,
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
 
   if (0 == ts_sz) {
     return WriteBatchInternal::Delete(this, cf_id, key);
@@ -1350,6 +1467,7 @@ Status WriteBatch::SingleDelete(ColumnFamilyHandle* column_family,
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
 
   if (0 == ts_sz) {
     return WriteBatchInternal::SingleDelete(this, cf_id, key);
@@ -1369,6 +1487,8 @@ Status WriteBatch::SingleDelete(ColumnFamilyHandle* column_family,
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
+
   has_key_with_ts_ = true;
   assert(column_family);
   uint32_t cf_id = column_family->GetID();
@@ -1419,6 +1539,7 @@ Status WriteBatch::SingleDelete(ColumnFamilyHandle* column_family,
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
 
   if (0 == ts_sz) {
     return WriteBatchInternal::SingleDelete(this, cf_id, key);
@@ -1597,6 +1718,7 @@ Status WriteBatch::Merge(ColumnFamilyHandle* column_family, const Slice& key,
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
 
   if (0 == ts_sz) {
     return WriteBatchInternal::Merge(this, cf_id, key, value);
@@ -1617,6 +1739,8 @@ Status WriteBatch::Merge(ColumnFamilyHandle* column_family, const Slice& key,
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
+
   has_key_with_ts_ = true;
   assert(column_family);
   uint32_t cf_id = column_family->GetID();
@@ -1669,6 +1793,7 @@ Status WriteBatch::Merge(ColumnFamilyHandle* column_family,
   if (!s.ok()) {
     return s;
   }
+  TryInsertGuardToBatch(this, column_family, key);
 
   if (0 == ts_sz) {
     return WriteBatchInternal::Merge(this, cf_id, key, value);
@@ -1845,6 +1970,10 @@ Status WriteBatch::VerifyChecksum() const {
       case kTypeColumnFamilyValuePreferredSeqno:
       case kTypeValuePreferredSeqno:
         tag = kTypeValuePreferredSeqno;
+        break;
+      case kTypeGuard:
+      case kTypeColumnFamilyGuard:
+        tag = kTypeGuard;
         break;
       default:
         return Status::Corruption(
@@ -2783,6 +2912,24 @@ class MemTableInserter : public WriteBatch::Handler {
     return ret_status;
   }
 
+  Status HandleGuardCF(uint32_t column_family_id, const Slice& key,
+                       unsigned level) override {
+    Status ret_status;
+    if (UNLIKELY(!SeekToColumnFamily(column_family_id, &ret_status))) {
+      return ret_status;
+    }
+    MemTable* mem = cf_mems_->GetMemTable();
+    GuardMetaData* g = new GuardMetaData();
+    InternalKey ikey(key, sequence_, kTypeValue);
+    g->guard_key = ikey;
+    g->level = level;
+    g->number_segments = 0;
+    g->refs = 1;
+    mem->AddGuard(level, g);
+    sequence_++;
+    return Status::OK();
+  }
+
   void CheckMemtableFull() {
     if (flush_scheduler_ != nullptr) {
       auto* cfd = cf_mems_->current();
@@ -3193,6 +3340,11 @@ class ProtectionInfoUpdater : public WriteBatch::Handler {
     return UpdateProtInfo(cf, key, val, kTypeBlobIndex);
   }
 
+  Status HandleGuardCF(uint32_t cf, const Slice& key,
+                       unsigned /*level*/) override {
+    return UpdateProtInfo(cf, key, "", kTypeGuard);
+  }
+
   Status MarkBeginPrepare(bool /* unprepare */) override {
     return Status::OK();
   }
@@ -3331,6 +3483,27 @@ Status WriteBatchInternal::UpdateProtectionInfo(WriteBatch* wb,
   }
   return Status::NotSupported(
       "WriteBatch protection info must be zero or eight bytes/key");
+}
+Status WriteBatchInternal::PutGuard(WriteBatch* b, uint32_t column_family_id,
+                                    const Slice& key, int level) {
+  std::string level_str;
+  PutVarint32(&level_str, level);
+  LocalSavePoint save(b);
+  WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
+  if (column_family_id == 0) {
+    b->rep_.push_back(static_cast<char>(kTypeGuard));
+    PutLengthPrefixedSlice(&b->rep_, key);
+    b->rep_.append(level_str);
+  } else {
+    b->rep_.push_back(static_cast<char>(kTypeColumnFamilyGuard));
+    PutVarint32(&b->rep_, column_family_id);
+    PutLengthPrefixedSlice(&b->rep_, key);
+    b->rep_.append(level_str);
+  }
+  b->content_flags_.store(
+      b->content_flags_.load(std::memory_order_relaxed) | HAS_GUARD,
+      std::memory_order_relaxed);
+  return save.commit();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

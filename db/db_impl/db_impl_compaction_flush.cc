@@ -3884,6 +3884,15 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         db_id_, db_session_id_, c->column_family_data()->GetFullHistoryTsLow(),
         c->trim_ts(), &blob_callback_, &bg_compaction_scheduled_,
         &bg_bottom_compaction_scheduled_);
+    
+    // Add the guard information in current version to edit
+    std::set<int> level_to_load_from_complete_guards;
+    level_to_load_from_complete_guards.insert(c->start_level());
+    if (c->start_level() != c->output_level()) {
+      level_to_load_from_complete_guards.insert(c->output_level());
+    }
+    c->column_family_data()->current()->storage_info()->AddGuardsToEdit(c->edit(), level_to_load_from_complete_guards);
+
     compaction_job.Prepare();
 
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,

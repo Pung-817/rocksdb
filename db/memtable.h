@@ -564,6 +564,29 @@ class MemTable {
                                     uint32_t protection_bytes_per_key,
                                     bool allow_data_in_errors = false);
 
+  void AddGuard(int level, GuardMetaData* g) {
+    std::lock_guard<std::mutex> lock(complete_guards_mutex_);
+    if (static_cast<size_t>(level) >= complete_guards_.size()) {
+      complete_guards_.resize(level + 1);
+    }
+    // Check if the guard key is already present in the level to avoid
+    // duplicates
+    for (auto* existing_guard : complete_guards_[level]) {
+      if (comparator_.comparator.user_comparator()->Compare(
+              existing_guard->guard_key.user_key(), g->guard_key.user_key()) ==
+          0) {
+        // Delete the new guard as it's a duplicate
+        delete g;
+        return;
+      }
+    }
+    complete_guards_[level].push_back(g);
+  }
+
+  const std::vector<std::vector<GuardMetaData*>>& GetCompleteGuards() const {
+    return complete_guards_;
+  }
+
  private:
   enum FlushStateEnum { FLUSH_NOT_REQUESTED, FLUSH_REQUESTED, FLUSH_SCHEDULED };
 
@@ -705,6 +728,9 @@ class MemTable {
                            SequenceNumber s, char* checksum_ptr);
 
   void MaybeUpdateNewestUDT(const Slice& user_key);
+
+  std::vector<std::vector<GuardMetaData*>> complete_guards_;
+  std::mutex complete_guards_mutex_;
 };
 
 const char* EncodeKey(std::string* scratch, const Slice& target);

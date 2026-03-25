@@ -119,6 +119,11 @@ class WriteBatch : public WriteBatchBase {
   Status PutEntity(const Slice& key,
                    const AttributeGroups& attribute_groups) override;
 
+  Status PutGuard(ColumnFamilyHandle* column_family, const Slice& key, int level);
+  Status PutGuard(const Slice& key, int level) {
+    return PutGuard(nullptr, key, level);
+  }
+
   using WriteBatchBase::Delete;
   // If the database contains a mapping for "key", erase it.  Else do nothing.
   // The following Delete(..., const Slice& key) can be used when user-defined
@@ -262,6 +267,11 @@ class WriteBatch : public WriteBatchBase {
                               uint64_t /*write_time*/) {
       return Status::InvalidArgument("TimedPutCF not implemented");
     }
+
+    virtual Status HandleGuardCF(uint32_t /*column_family_id*/, const Slice& /*key*/, unsigned /*level*/) {
+      return Status::InvalidArgument("HandleGuardCF not implemented");
+    }
+    virtual void HandleGuard(const Slice& /*key*/, unsigned /*level*/) {}
 
     // If user-defined timestamp is enabled, then `key` includes timestamp.
     virtual Status PutEntityCF(uint32_t /* column_family_id */,

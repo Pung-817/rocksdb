@@ -202,7 +202,7 @@ void LevelCompactionBuilder::PickFileToCompact(
 void LevelCompactionBuilder::SetupInitialFiles() {
   // Find the compactions by size on all levels.
   bool skipped_l0_to_base = false;
-  for (int i = 0; i < compaction_picker_->NumberLevels() - 1; i++) {
+  for (int i = 0; i < compaction_picker_->NumberLevels(); i++) {
     start_level_score_ = vstorage_->CompactionScore(i);
     start_level_ = vstorage_->CompactionScoreLevel(i);
     assert(i == 0 || start_level_score_ <= vstorage_->CompactionScore(i - 1));
@@ -213,8 +213,27 @@ void LevelCompactionBuilder::SetupInitialFiles() {
         // may starve.
         continue;
       }
-      output_level_ =
-          (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
+      // === PebblesDB: Horizontal compaction heuristic ===
+      bool horizontal_compaction = false;
+      int num_levels = vstorage_->num_levels();
+      if (start_level_ > 0 && start_level_ == num_levels - 1) {
+        horizontal_compaction = true;
+      } else if (start_level_ > 0 && start_level_ == num_levels - 2) {
+        uint64_t current_level_size = vstorage_->NumLevelBytes(start_level_);
+        uint64_t next_level_size = vstorage_->NumLevelBytes(start_level_ + 1);
+        if (current_level_size > 0 && 
+            static_cast<double>(next_level_size) / static_cast<double>(current_level_size) > 25.0) {
+          horizontal_compaction = true;
+        }
+      }
+
+      if (horizontal_compaction) {
+        output_level_ = start_level_;
+      } else {
+        output_level_ =
+            (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
+      }
+      // ====================================================
       bool picked_file_to_compact = PickFileToCompact();
       TEST_SYNC_POINT_CALLBACK("PostPickFileToCompact",
                                &picked_file_to_compact);
@@ -834,6 +853,49 @@ bool LevelCompactionBuilder::PickFileToCompact() {
     }
 
     start_level_inputs_.files.push_back(f);
+    
+    // === PebblesDB Horizontal Compaction Modification ===
+    // If we are doing a horizontal compaction (start_level_ == output_level_),
+    // we MUST gather ALL files in the same Guard as 'f' to merge them into a single file.
+    if (start_level_ > 0 && start_level_ == output_level_ && f->guard != nullptr) {
+        start_level_inputs_.files.clear();
+        
+        for (auto* gf : f->guard->file_metas) {
+            if (gf != nullptr) {
+                start_level_inputs_.files.push_back(gf);
+            }
+        }
+        
+        if (start_level_inputs_.files.empty()) {
+             start_level_inputs_.files.push_back(f);
+        }
+        
+        // For horizontal compaction within a guard, we have already picked all files
+        // within the guard boundary. The guard boundary itself is our clean cut.
+        // We MUST skip ExpandInputsToCleanCut, otherwise overlapping files from adjacent
+        // guards would be pulled in, leading to massive unintended compactions.
+        
+        // We also need to check if any of these files are already being compacted
+        bool files_in_compaction = false;
+        for (auto* gf : start_level_inputs_.files) {
+            if (gf->being_compacted) {
+                files_in_compaction = true;
+                break;
+            }
+        }
+        
+        if (files_in_compaction) {
+            start_level_inputs_.clear();
+            continue; // Skip this guard, try next file
+        }
+        
+        // For horizontal compaction, base_index_ is usually used for TrivialMove or output expansion.
+        // We can just set it to index.
+        base_index_ = index;
+        break;
+    }
+    // ====================================================
+
     if (!compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
                                                     &start_level_inputs_) ||
         compaction_picker_->FilesRangeOverlapWithCompaction(

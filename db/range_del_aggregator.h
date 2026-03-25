@@ -299,7 +299,7 @@ class RangeDelAggregator {
     ParsedInternalKey parsed;
 
     Status pik_status =
-        ParseInternalKey(ikey, &parsed, false /* log_err_key */);  // TODO
+        ParseInternalKey(ikey, &parsed, false /* log_err_key */);
     assert(pik_status.ok());
     if (!pik_status.ok()) {
       return false;

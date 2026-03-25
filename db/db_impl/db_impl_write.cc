@@ -1409,7 +1409,7 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
   }
 
   WriteBatchInternal::SetSequence(merged_batch, sequence);
-
+  
   uint64_t log_size;
 
   // TODO: plumb Env::IOActivity, Env::IOPriority
@@ -1418,6 +1418,7 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, log_used,
                     &log_size, log_file_number_size);
+                    
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -1520,7 +1521,7 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
   *last_sequence = versions_->FetchAddLastAllocatedSequence(seq_inc);
   auto sequence = *last_sequence + 1;
   WriteBatchInternal::SetSequence(merged_batch, sequence);
-
+  
   log::Writer* log_writer = logs_.back().writer;
   LogFileNumberSize& log_file_number_size = alive_log_files_.back();
 
@@ -1534,6 +1535,7 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
       write_group.leader->rate_limiter_priority;
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, log_used,
                     &log_size, log_file_number_size);
+                    
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;

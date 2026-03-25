@@ -80,6 +80,8 @@ class WriteBatchInternal {
   // WriteBatch header has an 8-byte sequence number followed by a 4-byte count.
   static constexpr size_t kHeader = 12;
 
+  static Status PutGuard(WriteBatch* batch, uint32_t column_family_id, const Slice& key, int level);
+  
   // WriteBatch methods with column_family_id instead of ColumnFamilyHandle*
   static Status Put(WriteBatch* batch, uint32_t column_family_id,
                     const Slice& key, const Slice& value);

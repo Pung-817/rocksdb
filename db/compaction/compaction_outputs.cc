@@ -10,6 +10,8 @@
 
 #include "db/compaction/compaction_outputs.h"
 
+#include <algorithm>
+#include "db/version_set.h"
 #include "db/builder.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -253,8 +255,23 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
     should_stop_for_ttl = UpdateFilesToCutForTTLStates(internal_key);
   }
 
+  // To split the files based on the guard keys boundaries for the output level
+  bool cross_guard = false;
+  if (current_guard_ < guards_.size() &&
+      icmp->user_comparator()->Compare(ExtractUserKey(internal_key), guards_[current_guard_]->guard_key.user_key()) >= 0) {
+    while (current_guard_ < guards_.size() &&
+           icmp->user_comparator()->Compare(ExtractUserKey(internal_key), guards_[current_guard_]->guard_key.user_key()) >= 0) {
+      current_guard_++;
+    }
+    cross_guard = true;
+  }
+
   if (!HasBuilder()) {
     return false;
+  }
+
+  if (cross_guard) {
+    return true;
   }
 
   if (should_stop_for_ttl) {
@@ -790,6 +807,25 @@ CompactionOutputs::CompactionOutputs(const Compaction* compaction,
   }
 
   level_ptrs_ = std::vector<size_t>(compaction_->number_levels(), 0);
+
+  if (compaction_->input_version() != nullptr && compaction_->output_level() != 0) {
+    int output_level = compaction_->output_level();
+    const auto& guards = compaction_->input_version()->storage_info()->LevelCompleteGuards(output_level);
+    if (!guards.empty()) {
+      guards_ = guards;
+      const InternalKeyComparator* icmp = &compaction_->column_family_data()->internal_comparator();
+      std::sort(guards_.begin(), guards_.end(),
+                [icmp](GuardMetaData* a, GuardMetaData* b) {
+                  return icmp->user_comparator()->Compare(a->guard_key.user_key(), b->guard_key.user_key()) < 0;
+                });
+      // Remove duplicates
+      auto last = std::unique(guards_.begin(), guards_.end(),
+                              [icmp](GuardMetaData* a, GuardMetaData* b) {
+                                return icmp->user_comparator()->Compare(a->guard_key.user_key(), b->guard_key.user_key()) == 0;
+                              });
+      guards_.erase(last, guards_.end());
+    }
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

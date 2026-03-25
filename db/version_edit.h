@@ -45,6 +45,12 @@ enum Tag : uint32_t {
   kPrevLogNumber = 9,
   kMinLogNumberToKeep = 10,
 
+  // PebblesDB Extensions
+  kDeletedGuard = 11,
+  kNewGuard = 12,
+  kFileInsideGuard = 13,
+  kNewCompleteGuard = 16,
+
   // these are new formats divergent from open source leveldb
   kNewFile2 = 100,
   kNewFile3 = 102,
@@ -163,21 +169,28 @@ struct FileDescriptor {
 };
 
 struct FileSampledStats {
-  FileSampledStats() : num_reads_sampled(0) {}
+  FileSampledStats() : num_reads_sampled(0), allowed_seeks(0) {}
   FileSampledStats(const FileSampledStats& other) { *this = other; }
   FileSampledStats& operator=(const FileSampledStats& other) {
     num_reads_sampled = other.num_reads_sampled.load();
+    allowed_seeks = other.allowed_seeks.load();
     return *this;
   }
 
   // number of user reads to this file.
   mutable std::atomic<uint64_t> num_reads_sampled;
+  // PebblesDB: Seek-based compaction threshold
+  mutable std::atomic<int> allowed_seeks;
 };
+
+struct GuardMetaData;
 
 struct FileMetaData {
   FileDescriptor fd;
   InternalKey smallest;  // Smallest internal key served by table
   InternalKey largest;   // Largest internal key served by table
+
+  GuardMetaData* guard = nullptr; // The guard that the file belongs to.
 
   // Needs to be disposed when refs becomes 0.
   Cache::Handle* table_reader_handle = nullptr;
@@ -201,6 +214,26 @@ struct FileMetaData {
   uint64_t raw_value_size = 0;  // total uncompressed value size.
   uint64_t num_range_deletions = 0;
   // This is computed during Flush/Compaction, and is added to
+
+  // Wrapper around std::atomic<bool> to allow copy/move of FileMetaData
+  struct AtomicMarkedForCompaction {
+   private:
+    std::atomic<bool> val_;
+   public:
+    AtomicMarkedForCompaction() : val_(false) {}
+    AtomicMarkedForCompaction(bool v) : val_(v) {}
+    AtomicMarkedForCompaction(const AtomicMarkedForCompaction& other) : val_(other.val_.load(std::memory_order_relaxed)) {}
+    AtomicMarkedForCompaction& operator=(const AtomicMarkedForCompaction& other) {
+      val_.store(other.val_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+      return *this;
+    }
+    AtomicMarkedForCompaction& operator=(bool v) {
+      val_.store(v, std::memory_order_relaxed);
+      return *this;
+    }
+    operator bool() const { return val_.load(std::memory_order_relaxed); }
+  };
+
   // `compensated_file_size`. Currently, this estimates the size of keys in the
   // next level covered by range tombstones in this file.
   uint64_t compensated_range_deletion_size = 0;
@@ -211,7 +244,7 @@ struct FileMetaData {
   bool init_stats_from_file = false;  // true if the data-entry stats of this
                                       // file has initialized from file.
 
-  bool marked_for_compaction = false;  // True if client asked us nicely to
+  AtomicMarkedForCompaction marked_for_compaction{false};  // True if client asked us nicely to
                                        // compact this file.
   Temperature temperature = Temperature::kUnknown;
 
@@ -286,6 +319,9 @@ struct FileMetaData {
         unique_id(std::move(_unique_id)),
         tail_size(_tail_size),
         user_defined_timestamps_persisted(_user_defined_timestamps_persisted) {
+    int seeks = file_size / 16384;
+    if (seeks < 100) seeks = 100;
+    stats.allowed_seeks.store(seeks, std::memory_order_relaxed);
     TEST_SYNC_POINT_CALLBACK("FileMetaData::FileMetaData", this);
   }
 
@@ -350,6 +386,25 @@ struct FileMetaData {
              file_checksum_func_name.size();
     return usage;
   }
+};
+
+
+// guard_key is the smallest key served by the guard file. In each level,
+// there can be only one guard starting with a given key, so (level, key)
+// uniquely identifies a guard.
+struct GuardMetaData {
+  int refs;
+  int level;
+  uint64_t number_segments;
+  InternalKey guard_key; // guard key is selected before any keys are inserted
+  /* Need not be same as guard_key. Ex: g: 100, smallest: 102 */
+  InternalKey smallest; 
+  InternalKey largest;   // Largest internal key served by table
+  // The list of file numbers that form a part of this guard.
+  std::vector<uint64_t> files;
+  std::vector<FileMetaData*> file_metas;
+  
+  GuardMetaData() : refs(0), level(-1), number_segments(0), guard_key(), smallest(), largest() { files.clear(); }
 };
 
 // A compressed copy of file meta data that just contain minimum data needed
@@ -466,6 +521,27 @@ class VersionEdit {
   // Retrieve the table files deleted as well as their associated levels.
   using DeletedFiles = std::set<std::pair<int, uint64_t>>;
   const DeletedFiles& GetDeletedFiles() const { return deleted_files_; }
+
+  void DeleteGuard(int level, const InternalKey& guard_key) {
+    deleted_guards_.push_back(std::make_pair(level, guard_key));
+  }
+
+  using DeletedGuards = std::vector<std::pair<int, InternalKey>>;
+  const DeletedGuards& GetDeletedGuards() const { return deleted_guards_; }
+
+  void AddGuard(int level, const GuardMetaData& guard_meta_data) {
+    new_guards_.push_back(std::make_pair(level, guard_meta_data));
+  }
+
+  using NewGuards = std::vector<std::pair<int, GuardMetaData>>;
+  const NewGuards& GetNewGuards() const { return new_guards_; }
+
+  void AddCompleteGuard(int level, const GuardMetaData& guard_meta_data) {
+    new_complete_guards_.push_back(std::make_pair(level, guard_meta_data));
+  }
+
+  using NewCompleteGuards = std::vector<std::pair<int, GuardMetaData>>;
+  const NewCompleteGuards& GetNewCompleteGuards() const { return new_complete_guards_; }
 
   // Add the specified table file at the specified level.
   // REQUIRES: "smallest" and "largest" are smallest and largest keys in file
@@ -732,6 +808,10 @@ class VersionEdit {
 
   DeletedFiles deleted_files_;
   NewFiles new_files_;
+
+  DeletedGuards deleted_guards_;
+  NewGuards new_guards_;
+  NewCompleteGuards new_complete_guards_;
 
   BlobFileAdditions blob_file_additions_;
   BlobFileGarbages blob_file_garbages_;

@@ -1047,6 +1047,17 @@ Status FlushJob::WriteLevel0Table() {
                    meta_.unique_id, meta_.compensated_range_deletion_size,
                    meta_.tail_size, meta_.user_defined_timestamps_persisted);
     edit_->SetBlobFileAdditions(std::move(blob_file_additions));
+    
+    // Add guards from memtables to VersionEdit
+    for (MemTable* m : mems_) {
+      const auto& complete_guards = m->GetCompleteGuards();
+      for (size_t level = 0; level < complete_guards.size(); ++level) {
+        for (GuardMetaData* g : complete_guards[level]) {
+          edit_->AddCompleteGuard(level, *g);
+        }
+      }
+    }
+
   }
   // Piggyback FlushJobInfo on the first first flushed memtable.
   mems_[0]->SetFlushJobInfo(GetFlushJobInfo());

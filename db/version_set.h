@@ -147,6 +147,36 @@ class VersionStorageInfo {
 
   void AddFile(int level, FileMetaData* f);
 
+  void AddGuard(int level, GuardMetaData* g) {
+    g->refs++;
+    guards_[level].push_back(g);
+  }
+
+  void AddCompleteGuard(int level, GuardMetaData* g) {
+    g->refs++;
+    complete_guards_[level].push_back(g);
+  }
+
+  void AddSentinelFile(int level, FileMetaData* f) {
+    // sentinel_files_ only stores pointers to files, no ref increment here, because files_ array manages refs
+    sentinel_files_[level].push_back(f);
+  }
+
+  void AddGuardsToEdit(VersionEdit* edit, const std::set<int>& level_to_load_complete_guards) {
+    assert(edit != nullptr);
+    for (int i = 0; i < num_levels_; i++) {
+      if (level_to_load_complete_guards.count(i) > 0) {
+        for (size_t j = 0; j < complete_guards_[i].size(); j++) {
+          edit->AddGuard(i, *complete_guards_[i][j]);
+        }
+      }
+    }
+  }
+
+  const std::vector<GuardMetaData*>& LevelGuards(int level) const { return guards_[level]; }
+  const std::vector<GuardMetaData*>& LevelCompleteGuards(int level) const { return complete_guards_[level]; }
+  const std::vector<FileMetaData*>& LevelSentinelFiles(int level) const { return sentinel_files_[level]; }
+
   // Resize/Initialize the space for compact_cursor_
   void ResizeCompactCursors(int level) {
     compact_cursor_.resize(level, InternalKey());
@@ -258,6 +288,10 @@ class VersionStorageInfo {
 
   // Return idx'th highest score
   double CompactionScore(int idx) const { return compaction_score_[idx]; }
+
+  // PebblesDB methods
+  double GuardCompactionScore(int level, int guard_idx) const { return guard_compaction_scores_[level][guard_idx]; }
+  double SentinelCompactionScore(int level) const { return sentinel_compaction_scores_[level]; }
 
   void GetOverlappingInputs(
       int level, const InternalKey* begin,  // nullptr means before all keys
@@ -659,6 +693,11 @@ class VersionStorageInfo {
   using FileLocations = UnorderedMap<uint64_t, FileLocation>;
   FileLocations file_locations_;
 
+  // List of guards per level.
+  std::vector<GuardMetaData*>* guards_;
+  std::vector<GuardMetaData*>* complete_guards_;
+  std::vector<FileMetaData*>* sentinel_files_;
+
   // Vector of blob files in version sorted by blob file number.
   BlobFiles blob_files_;
 
@@ -735,6 +774,11 @@ class VersionStorageInfo {
   // These are used to pick the best compaction level
   std::vector<double> compaction_score_;
   std::vector<int> compaction_level_;
+
+  // PebblesDB: Guard and Sentinel compaction scores for each level
+  std::vector<std::vector<double>> guard_compaction_scores_;
+  std::vector<double> sentinel_compaction_scores_;
+
   int l0_delay_trigger_count_ = 0;  // Count used to trigger slow down and stop
                                     // for number of L0 files.
 

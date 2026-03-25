@@ -80,6 +80,9 @@ void VersionEdit::Clear() {
   compact_cursors_.clear();
   deleted_files_.clear();
   new_files_.clear();
+  deleted_guards_.clear();
+  new_guards_.clear();
+  new_complete_guards_.clear();
   blob_file_additions_.clear();
   blob_file_garbages_.clear();
   wal_additions_.clear();
@@ -132,6 +135,26 @@ bool VersionEdit::EncodeTo(std::string* dst,
   for (const auto& deleted : deleted_files_) {
     PutVarint32Varint32Varint64(dst, kDeletedFile, deleted.first /* level */,
                                 deleted.second /* file number */);
+  }
+
+  for (const auto& deleted : deleted_guards_) {
+    PutVarint32(dst, kDeletedGuard);
+    PutVarint32(dst, deleted.first);   // level
+    PutLengthPrefixedSlice(dst, deleted.second.Encode()); // guard key
+  }
+
+  for (const auto& new_guard : new_guards_) {
+    const GuardMetaData& g = new_guard.second;
+    PutVarint32(dst, kNewGuard);
+    PutVarint32(dst, g.level);
+    PutLengthPrefixedSlice(dst, g.guard_key.Encode());
+  }
+
+  for (const auto& complete_guard : new_complete_guards_) {
+    const GuardMetaData& g = complete_guard.second;
+    PutVarint32(dst, kNewCompleteGuard);
+    PutVarint32(dst, g.level);
+    PutLengthPrefixedSlice(dst, g.guard_key.Encode());
   }
 
   bool min_log_num_written = false;
@@ -598,6 +621,47 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         break;
       }
 
+      case kDeletedGuard: {
+        if (GetLevel(&input, &level, &msg) && GetInternalKey(&input, &key)) {
+          deleted_guards_.push_back(std::make_pair(level, key));
+        } else {
+          if (!msg) {
+            msg = "deleted guard";
+          }
+        }
+        break;
+      }
+
+      case kNewGuard: {
+        GuardMetaData g;
+        if (GetLevel(&input, &g.level, &msg)
+            && GetInternalKey(&input, &g.guard_key)) {
+          g.number_segments = 0;
+          g.files.clear();
+          new_guards_.push_back(std::make_pair(g.level, g));
+        } else {
+          if (!msg) {
+            msg = "new-guard entry";
+          }
+        }
+        break;
+      }
+
+      case kNewCompleteGuard: {
+        GuardMetaData g;
+        if (GetLevel(&input, &g.level, &msg)
+            && GetInternalKey(&input, &g.guard_key)) {
+          g.number_segments = 0;
+          g.files.clear();
+          new_complete_guards_.push_back(std::make_pair(g.level, g));
+        } else {
+          if (!msg) {
+            msg = "new-complete-guard entry";
+          }
+        }
+        break;
+      }
+
       case kNewFile: {
         uint64_t number = 0;
         uint64_t file_size = 0;
@@ -614,6 +678,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         }
         break;
       }
+
       case kNewFile2: {
         uint64_t number = 0;
         uint64_t file_size = 0;
@@ -923,6 +988,29 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     AppendNumberTo(&r, f.tail_size);
     r.append(" User-defined timestamps persisted: ");
     r.append(f.user_defined_timestamps_persisted ? "true" : "false");
+  }
+
+  for (const auto& deleted : deleted_guards_) {
+    r.append("\n  DeleteGuard: ");
+    AppendNumberTo(&r, deleted.first);
+    r.append(" ");
+    r.append(deleted.second.DebugString(hex_key));
+  }
+
+  for (const auto& new_guard : new_guards_) {
+    const GuardMetaData& g = new_guard.second;
+    r.append("\n  AddGuard: ");
+    AppendNumberTo(&r, g.level);
+    r.append(" ");
+    r.append(g.guard_key.DebugString(hex_key));
+  }
+
+  for (const auto& complete_guard : new_complete_guards_) {
+    const GuardMetaData& g = complete_guard.second;
+    r.append("\n  AddCompleteGuard: ");
+    AppendNumberTo(&r, g.level);
+    r.append(" ");
+    r.append(g.guard_key.DebugString(hex_key));
   }
 
   for (const auto& blob_file_addition : blob_file_additions_) {
