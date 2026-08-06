@@ -1,0 +1,31 @@
+[manifest]
+name = folly
+
+[build]
+builder = cmake
+job_weight_mib = 1024
+
+[dependencies]
+gflags
+glog
+boost
+libdwarf
+libevent
+libsodium
+double-conversion
+fast_float
+fmt
+lz4
+openssl
+snappy
+zstd
+libiberty
+libunwind
+xz
+
+[cmake.defines]
+BUILD_SHARED_LIBS = ON
+BOOST_LINK_STATIC = OFF
+BUILD_TESTS = OFF
+BUILD_BENCHMARKS = OFF
+FOLLY_NO_EXCEPTION_TRACER = ON

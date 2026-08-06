@@ -96,5 +96,6 @@ fuzz/crash-*
 
 cmake-build-*
 third-party/folly/
+.cachelib/
 .cache
 *.sublime-*

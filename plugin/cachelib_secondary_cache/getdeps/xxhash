@@ -1,0 +1,19 @@
+[manifest]
+name = xxhash
+
+[git]
+repo_url = https://github.com/Cyan4973/xxHash.git
+rev = bbb27a5efb85b92a0486cf361a8635715a53f6ba
+
+[build.not(os=windows)]
+builder = make
+
+[make.build_args]
+all
+
+[make.install_args]
+install
+
+[build.os=windows]
+builder = cmake
+subdir = cmake_unofficial

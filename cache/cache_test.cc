@@ -9,6 +9,7 @@
 
 #include "rocksdb/cache.h"
 
+#include <atomic>
 #include <forward_list>
 #include <functional>
 #include <iostream>
@@ -18,6 +19,9 @@
 #include "cache/lru_cache.h"
 #include "cache/typed_cache.h"
 #include "port/stack_trace.h"
+#include "rocksdb/convenience.h"
+#include "rocksdb/secondary_cache.h"
+#include "rocksdb/utilities/object_registry.h"
 #include "test_util/secondary_cache_test_util.h"
 #include "test_util/testharness.h"
 #include "util/coding.h"
@@ -76,7 +80,90 @@ const Cache::CacheItemHelper kInvokeOnDeleteHelper{
       auto& fn = *static_cast<std::function<void()>*>(value);
       fn();
     }};
+
+class PreparingSecondaryCache : public SecondaryCache {
+ public:
+  static const char* kClassName() { return "PreparingSecondaryCache"; }
+
+  const char* Name() const override { return kClassName(); }
+
+  Status Insert(const Slice&, Cache::ObjectPtr,
+                const Cache::CacheItemHelper*, bool) override {
+    return Status::OK();
+  }
+
+  Status InsertSaved(const Slice&, const Slice&, CompressionType,
+                     CacheTier) override {
+    return Status::OK();
+  }
+
+  std::unique_ptr<SecondaryCacheResultHandle> Lookup(
+      const Slice&, const Cache::CacheItemHelper*, Cache::CreateContext*, bool,
+      bool, Statistics*, bool& kept_in_sec_cache) override {
+    kept_in_sec_cache = false;
+    return nullptr;
+  }
+
+  bool SupportForceErase() const override { return false; }
+
+  void Erase(const Slice&) override {}
+
+  void WaitAll(std::vector<SecondaryCacheResultHandle*>) override {}
+
+  Status PrepareOptions(const ConfigOptions& config_options) override {
+    ++prepare_count;
+    return SecondaryCache::PrepareOptions(config_options);
+  }
+
+  static std::atomic<int> prepare_count;
+};
+
+std::atomic<int> PreparingSecondaryCache::prepare_count{0};
 }  // anonymous namespace
+
+TEST(CacheCreateFromStringTest, PreparesNestedSecondaryCache) {
+  ObjectLibrary::Default()->AddFactory<SecondaryCache>(
+      PreparingSecondaryCache::kClassName(),
+      [](const std::string&, std::unique_ptr<SecondaryCache>* guard,
+         std::string*) {
+        guard->reset(new PreparingSecondaryCache());
+        return guard->get();
+      });
+
+  PreparingSecondaryCache::prepare_count = 0;
+  std::shared_ptr<Cache> cache;
+  ConfigOptions config_options;
+  ASSERT_OK(Cache::CreateFromString(
+      config_options,
+      "capacity=1M;secondary_cache={id=PreparingSecondaryCache}", &cache));
+  ASSERT_NE(cache, nullptr);
+  ASSERT_EQ(PreparingSecondaryCache::prepare_count, 1);
+
+  BlockBasedTableOptions table_options;
+  ASSERT_OK(GetBlockBasedTableOptionsFromString(
+      config_options, BlockBasedTableOptions(),
+      "block_cache={capacity=1M;"
+      "secondary_cache={id=PreparingSecondaryCache}}",
+      &table_options));
+  ASSERT_NE(table_options.block_cache, nullptr);
+  ASSERT_EQ(PreparingSecondaryCache::prepare_count, 2);
+
+  ColumnFamilyOptions column_family_options;
+  ASSERT_OK(GetColumnFamilyOptionsFromString(
+      config_options, ColumnFamilyOptions(),
+      "blob_cache={capacity=1M;"
+      "secondary_cache={id=PreparingSecondaryCache}}",
+      &column_family_options));
+  ASSERT_NE(column_family_options.blob_cache, nullptr);
+  ASSERT_EQ(PreparingSecondaryCache::prepare_count, 3);
+
+  config_options.invoke_prepare_options = false;
+  ASSERT_OK(Cache::CreateFromString(
+      config_options,
+      "capacity=1M;secondary_cache={id=PreparingSecondaryCache}", &cache));
+  ASSERT_NE(cache, nullptr);
+  ASSERT_EQ(PreparingSecondaryCache::prepare_count, 3);
+}
 
 class CacheTest : public testing::Test,
                   public secondary_cache_test_util::WithCacheTypeParam {

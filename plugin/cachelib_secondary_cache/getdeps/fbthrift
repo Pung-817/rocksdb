@@ -1,0 +1,21 @@
+[manifest]
+name = fbthrift
+
+[build]
+builder = cmake
+job_weight_mib = 2048
+
+[dependencies]
+fizz
+fmt
+folly
+libsodium
+wangle
+zstd
+mvfst
+xxhash
+
+[cmake.defines]
+BUILD_SHARED_LIBS = ON
+BUILD_TESTS = OFF
+enable_tests = OFF

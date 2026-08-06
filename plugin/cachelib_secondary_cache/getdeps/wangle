@@ -1,0 +1,14 @@
+[manifest]
+name = wangle
+
+[build]
+builder = cmake
+subdir = wangle
+
+[dependencies]
+folly
+fizz
+
+[cmake.defines]
+BUILD_SHARED_LIBS = ON
+BUILD_TESTS = OFF

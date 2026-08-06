@@ -1,0 +1,23 @@
+[manifest]
+name = cachelib
+
+[build]
+builder = cmake
+subdir = cachelib
+job_weight_mib = 2048
+
+[dependencies]
+zlib
+fizz
+fmt
+folly
+fbthrift
+wangle
+zstd
+mvfst
+# OpenSSL remains a system prerequisite on Linux in upstream getdeps.
+
+[cmake.defines]
+BUILD_SHARED_LIBS = ON
+BUILD_TESTS = OFF
+CACHELIB_BUILD_NAVY_ONLY = ON

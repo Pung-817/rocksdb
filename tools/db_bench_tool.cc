@@ -4729,12 +4729,20 @@ class Benchmark {
         options.table_factory->GetOptions<BlockBasedTableOptions>();
     if (table_options != nullptr) {
       if (FLAGS_cache_size > 0) {
-        // This violates this function's rules on when to set options. But we
-        // have to do it because the case of unconfigured block cache in OPTIONS
-        // file is indistinguishable (it is sanitized to 32MB by this point, not
-        // nullptr), and our regression tests assume this will be the shared
-        // block cache, even with OPTIONS file provided.
-        table_options->block_cache = cache_;
+        size_t secondary_capacity = 0;
+        Status secondary_status =
+            table_options->block_cache == nullptr
+                ? Status::NotFound("Block cache is not configured")
+                : table_options->block_cache->GetSecondaryCacheCapacity(
+                      secondary_capacity);
+        if (!secondary_status.ok() || secondary_capacity == 0) {
+          // This violates this function's rules on when to set options. But we
+          // have to do it because the case of unconfigured block cache in
+          // OPTIONS file is indistinguishable (it is sanitized to 32MB by this
+          // point, not nullptr), and our regression tests assume this will be
+          // the shared block cache, even with OPTIONS file provided.
+          table_options->block_cache = cache_;
+        }
       }
       if (table_options->filter_policy == nullptr) {
         if (FLAGS_bloom_bits < 0) {

@@ -38,6 +38,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct LRUCacheOptions, low_pri_pool_ratio),
           OptionType::kDouble, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"secondary_cache",
+         OptionTypeInfo::AsCustomSharedPtr<SecondaryCache>(
+             offsetof(struct LRUCacheOptions, secondary_cache),
+             OptionVerificationType::kByNameAllowNull,
+             OptionTypeFlags::kAllowNull)},
 };
 
 static std::unordered_map<std::string, OptionTypeInfo>
@@ -124,7 +129,14 @@ Status SecondaryCache::CreateFromString(
     }
     return status;
   } else {
-    return LoadSharedObject<SecondaryCache>(config_options, value, result);
+    std::shared_ptr<SecondaryCache> secondary_cache;
+    Status status =
+        LoadSharedObject<SecondaryCache>(config_options, value,
+                                         &secondary_cache);
+    if (status.ok()) {
+      result->swap(secondary_cache);
+    }
+    return status;
   }
 }
 
@@ -140,6 +152,10 @@ Status Cache::CreateFromString(const ConfigOptions& config_options,
     status = OptionTypeInfo::ParseStruct(config_options, "",
                                          &lru_cache_options_type_info, "",
                                          value, &cache_opts);
+    if (status.ok() && config_options.invoke_prepare_options &&
+        cache_opts.secondary_cache != nullptr) {
+      status = cache_opts.secondary_cache->PrepareOptions(config_options);
+    }
     if (status.ok()) {
       cache = NewLRUCache(cache_opts);
     }

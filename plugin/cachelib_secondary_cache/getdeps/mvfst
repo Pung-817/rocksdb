@@ -1,0 +1,14 @@
+[manifest]
+name = mvfst
+
+[build]
+builder = cmake
+subdir = .
+
+[dependencies]
+folly
+fizz
+
+[cmake.defines]
+BUILD_SHARED_LIBS = ON
+BUILD_TESTS = OFF

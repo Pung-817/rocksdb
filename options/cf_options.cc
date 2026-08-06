@@ -812,7 +812,9 @@ static std::unordered_map<std::string, OptionTypeInfo>
           [](const ConfigOptions& opts, const std::string&,
              const std::string& value, void* addr) {
             auto* cache = static_cast<std::shared_ptr<Cache>*>(addr);
-            return Cache::CreateFromString(opts, value, cache);
+            ConfigOptions cache_opts = opts;
+            cache_opts.invoke_prepare_options = true;
+            return Cache::CreateFromString(cache_opts, value, cache);
           }}},
         {"persist_user_defined_timestamps",
          {offsetof(struct ImmutableCFOptions, persist_user_defined_timestamps),

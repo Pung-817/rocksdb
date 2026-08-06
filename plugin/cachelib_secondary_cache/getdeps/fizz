@@ -1,0 +1,18 @@
+[manifest]
+name = fizz
+
+[build]
+builder = cmake
+subdir = fizz
+
+[dependencies]
+folly
+liboqs
+libsodium
+zlib
+zstd
+
+[cmake.defines]
+BUILD_SHARED_LIBS = ON
+BUILD_EXAMPLES = OFF
+BUILD_TESTS = OFF
